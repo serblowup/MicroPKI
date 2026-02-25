@@ -1,0 +1,52 @@
+# Бинарные
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+micro-pki
+micropki
+/bin/
+
+# Каталоги зависимостей
+vendor/
+node_modules/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Файлы, сгенерированные ОС
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Спецификация проекта
+pki/
+*.log
+*.pass
+secrets/
+*.pem
+*.crt
+*.key
+
+# Файлы Go workspace
+go.work
+go.work.sum
+
+# Тестовый исполняемый файл, собранный с помощью `go test -c`
+*.test
+
+# Результат go coverage
+*.out
+*.cov
+coverage.html
