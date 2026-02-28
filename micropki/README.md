@@ -30,7 +30,7 @@
 ```bash
 # Клонирование репозитория
 git clone https://github.com/serblowup/MicroPKI.git
-cd MicroPKI
+cd MicroPKI/micropki
 
 # Установка зависимостей
 go mod tidy
