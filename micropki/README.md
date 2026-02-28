@@ -321,11 +321,12 @@ make test-integration
 
 ## Структура проекта
 
-```
+```text
 MicroPKI/
 ├── docs
 │   └── sprints
-│       └── 1 sprint.md
+│       ├── 1 sprint.md
+│       └── 2 sprint.md
 ├── .gitignore
 └── micropki
     ├── cmd
