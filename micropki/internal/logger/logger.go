@@ -21,7 +21,7 @@ func Init(logFilePath string) error {
 	if logFilePath != "" {
 		file, err := os.OpenFile(logFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
-			return fmt.Errorf("Ошибка открытия файла лога: %w", err)
+			return fmt.Errorf("ошибка открытия файла лога: %w", err)
 		}
 		logFile = file
 		writer = file
@@ -74,6 +74,14 @@ func Error(format string, v ...interface{}) {
 			msg = "[REDACTED: потенциальная парольная фраза]"
 		}
 		errorLogger.Println(formatMessage("ERROR", msg))
+	}
+}
+
+func Audit(serial, subject, template string) {
+	if infoLogger != nil {
+		msg := fmt.Sprintf("audit: issued certificate serial=%x subject=%s template=%s timestamp=%s",
+			serial, subject, template, time.Now().UTC().Format(time.RFC3339))
+		infoLogger.Println(formatMessage("INFO", msg))
 	}
 }
 

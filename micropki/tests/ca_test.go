@@ -1,6 +1,7 @@
 package tests
 
 import (
+	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
@@ -11,6 +12,7 @@ import (
 	"MicroPKI/internal/ca"
 	"MicroPKI/internal/certs"
 	"MicroPKI/internal/cryptoutil"
+	"MicroPKI/internal/csr"
 )
 
 func TestRootCAInitialization(t *testing.T) {
@@ -51,7 +53,7 @@ func TestRootCAInitialization(t *testing.T) {
 		t.Fatal(err)
 	}
 	if info.Mode().Perm() != 0600 {
-		t.Errorf("Неправильные права на ключ: ожидалось 0600, получено %o", info.Mode().Perm())
+		t.Errorf("неправильные права на ключ: ожидалось 0600, получено %o", info.Mode().Perm())
 	}
 }
 
@@ -131,7 +133,163 @@ func TestKeyCertMatching(t *testing.T) {
 
 	_, ok := loadedKey.(*rsa.PrivateKey)
 	if !ok {
-		t.Fatal("Загруженный ключ не является RSA ключом")
+		t.Fatal("загруженный ключ не является RSA ключом")
+	}
+}
+
+func TestIntermediateCA(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "pki-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	rootPassFile := filepath.Join(tmpDir, "root.pass")
+	if err := os.WriteFile(rootPassFile, []byte("rootpass123\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	rootCA, err := ca.NewRootCA(
+		"/CN=Test Root CA",
+		"rsa",
+		4096,
+		rootPassFile,
+		tmpDir,
+		365,
+		false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := rootCA.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+
+	interPassFile := filepath.Join(tmpDir, "inter.pass")
+	if err := os.WriteFile(interPassFile, []byte("interpass123\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	rootKey, err := cryptoutil.LoadEncryptedPrivateKey(
+		filepath.Join(tmpDir, "private", "ca.key.pem"),
+		[]byte("rootpass123"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rootCertPEM, err := os.ReadFile(filepath.Join(tmpDir, "certs", "ca.cert.pem"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, _ := pem.Decode(rootCertPEM)
+	rootCert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	interKey, err := rsa.GenerateKey(rand.Reader, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cryptoutil.SaveEncryptedRSAPEM(
+		filepath.Join(tmpDir, "private", "intermediate.key.pem"),
+		interKey,
+		[]byte("interpass123"),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	csrPEM, err := csr.GenerateIntermediateCSR(
+		"/CN=Test Intermediate CA",
+		&interKey.PublicKey,
+		interKey,
+		0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	csrPath := filepath.Join(tmpDir, "csrs", "intermediate.csr.pem")
+	if err := os.MkdirAll(filepath.Join(tmpDir, "csrs"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := csr.SaveCSR(csrPath, csrPEM); err != nil {
+		t.Fatal(err)
+	}
+
+	checkFileExists(t, csrPath)
+
+	csrObj, err := csr.ParseCSR(csrPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	serialNumber, err := certs.GenerateSerialNumber()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ski, err := certs.CalculateSKI(&interKey.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	template := &x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject:      csrObj.Subject,
+		Issuer:       rootCert.Subject,
+		NotBefore:    rootCert.NotBefore,
+		NotAfter:     rootCert.NotAfter,
+
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		MaxPathLenZero:        true,
+
+		SubjectKeyId:   ski,
+		AuthorityKeyId: rootCert.SubjectKeyId,
+	}
+
+	interCertDER, err := x509.CreateCertificate(rand.Reader, template, rootCert, &interKey.PublicKey, rootKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	interCertPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: interCertDER,
+	})
+
+	interCertPath := filepath.Join(tmpDir, "certs", "intermediate.cert.pem")
+	if err := os.WriteFile(interCertPath, interCertPEM, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	checkFileExists(t, interCertPath)
+
+	interCA, err := ca.NewIntermediateCA(
+		interCertPath,
+		filepath.Join(tmpDir, "private", "intermediate.key.pem"),
+		interPassFile,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	interCert, interSigner, err := interCA.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !interCert.IsCA {
+		t.Error("промежуточный сертификат должен быть CA")
+	}
+
+	if interSigner == nil {
+		t.Error("подпись не загружена")
 	}
 }
 
@@ -157,7 +315,7 @@ func TestNegativeCases(t *testing.T) {
 		expectError bool
 	}{
 		{
-			name:        "Пустой subject",
+			name:        "пустой subject",
 			subject:     "",
 			keyType:     "rsa",
 			keySize:     4096,
@@ -166,7 +324,7 @@ func TestNegativeCases(t *testing.T) {
 			expectError: true,
 		},
 		{
-			name:        "Неправильный тип ключа",
+			name:        "неправильный тип ключа",
 			subject:     "/CN=Test",
 			keyType:     "dsa",
 			keySize:     4096,
@@ -175,7 +333,7 @@ func TestNegativeCases(t *testing.T) {
 			expectError: true,
 		},
 		{
-			name:        "Неправильный размер RSA ключа",
+			name:        "неправильный размер RSA ключа",
 			subject:     "/CN=Test",
 			keyType:     "rsa",
 			keySize:     2048,
@@ -184,7 +342,7 @@ func TestNegativeCases(t *testing.T) {
 			expectError: true,
 		},
 		{
-			name:        "Неправильный размер ECC ключа",
+			name:        "неправильный размер ECC ключа",
 			subject:     "/CN=Test",
 			keyType:     "ecc",
 			keySize:     256,
@@ -193,7 +351,7 @@ func TestNegativeCases(t *testing.T) {
 			expectError: true,
 		},
 		{
-			name:        "Несуществующий файл пароля",
+			name:        "несуществующий файл пароля",
 			subject:     "/CN=Test",
 			keyType:     "rsa",
 			keySize:     4096,
@@ -202,7 +360,7 @@ func TestNegativeCases(t *testing.T) {
 			expectError: true,
 		},
 		{
-			name:        "Отрицательный срок действия",
+			name:        "отрицательный срок действия",
 			subject:     "/CN=Test",
 			keyType:     "rsa",
 			keySize:     4096,
@@ -225,17 +383,17 @@ func TestNegativeCases(t *testing.T) {
 			)
 			if err != nil {
 				if !tt.expectError {
-					t.Errorf("Неожиданная ошибка при создании: %v", err)
+					t.Errorf("неожиданная ошибка при создании: %v", err)
 				}
 				return
 			}
 
 			err = rootCA.Initialize()
 			if tt.expectError && err == nil {
-				t.Error("Ожидалась ошибка, но ее не было")
+				t.Error("ожидалась ошибка, но ее не было")
 			}
 			if !tt.expectError && err != nil {
-				t.Errorf("Неожиданная ошибка: %v", err)
+				t.Errorf("неожиданная ошибка: %v", err)
 			}
 		})
 	}
@@ -254,11 +412,11 @@ func TestDNParsing(t *testing.T) {
 	for _, tt := range tests {
 		name, err := certs.ParseDN(tt.input)
 		if err != nil {
-			t.Errorf("Ошибка парсинга %s: %v", tt.input, err)
+			t.Errorf("ошибка парсинга %s: %v", tt.input, err)
 			continue
 		}
 		if name.CommonName != tt.expected {
-			t.Errorf("Для %s ожидалось CN=%s, получено %s", tt.input, tt.expected, name.CommonName)
+			t.Errorf("для %s ожидалось CN=%s, получено %s", tt.input, tt.expected, name.CommonName)
 		}
 	}
 }
@@ -275,11 +433,11 @@ func TestGenerateSerialNumber(t *testing.T) {
 	}
 
 	if serial1.Cmp(serial2) == 0 {
-		t.Error("Сгенерированы одинаковые серийные номера")
+		t.Error("сгенерированы одинаковые серийные номера")
 	}
 
 	if serial1.Sign() <= 0 {
-		t.Error("Серийный номер должен быть положительным")
+		t.Error("серийный номер должен быть положительным")
 	}
 }
 
@@ -319,7 +477,7 @@ func TestCertificateVerification(t *testing.T) {
 
 	block, _ := pem.Decode(certPEM)
 	if block == nil {
-		t.Fatal("Не удалось декодировать PEM")
+		t.Fatal("не удалось декодировать PEM")
 	}
 
 	cert, err := x509.ParseCertificate(block.Bytes)
@@ -328,20 +486,20 @@ func TestCertificateVerification(t *testing.T) {
 	}
 
 	if !cert.IsCA {
-		t.Error("Сертификат не является CA")
+		t.Error("сертификат не является CA")
 	}
 
 	if cert.KeyUsage&x509.KeyUsageCertSign == 0 {
-		t.Error("Отсутствует KeyUsage CertSign")
+		t.Error("отсутствует KeyUsage CertSign")
 	}
 
 	if cert.KeyUsage&x509.KeyUsageCRLSign == 0 {
-		t.Error("Отсутствует KeyUsage CRLSign")
+		t.Error("отсутствует KeyUsage CRLSign")
 	}
 }
 
 func checkFileExists(t *testing.T, path string) {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
-		t.Errorf("Файл не существует: %s", path)
+		t.Errorf("файл не существует: %s", path)
 	}
 }

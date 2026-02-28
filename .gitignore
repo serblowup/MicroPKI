@@ -1,4 +1,4 @@
-# Бинарные
+# Бинарные файлы
 *.exe
 *.exe~
 *.dll
@@ -6,9 +6,8 @@
 *.dylib
 *.test
 *.out
-micro-pki
-/micropki
 /bin/
+/micropki/bin/
 
 # Каталоги зависимостей
 vendor/
@@ -30,14 +29,20 @@ node_modules/
 ehthumbs.db
 Thumbs.db
 
-# Спецификация проекта
-pki/
-*.log
-*.pass
-secrets/
+# PKI директории (игнорируем сгенерированные сертификаты и ключи)
+/pki/
+/micropki/pki/
 *.pem
 *.crt
 *.key
+*.csr
+*.pass
+secrets/
+/micropki/secrets/
+
+# Логи
+*.log
+/micropki/*.log
 
 # Файлы Go workspace
 go.work
@@ -50,3 +55,8 @@ go.work.sum
 *.out
 *.cov
 coverage.html
+/micropki/coverage.html
+
+# Временные файлы
+tmp/
+/micropki/tmp/

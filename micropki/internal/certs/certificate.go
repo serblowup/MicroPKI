@@ -18,7 +18,7 @@ func GenerateSerialNumber() (*big.Int, error) {
 	serialNumber := make([]byte, 20)
 	_, err := rand.Read(serialNumber)
 	if err != nil {
-		return nil, fmt.Errorf("Ошибка генерации серийного номера: %w", err)
+		return nil, fmt.Errorf("ошибка генерации серийного номера: %w", err)
 	}
 	return new(big.Int).SetBytes(serialNumber), nil
 }
@@ -26,7 +26,7 @@ func GenerateSerialNumber() (*big.Int, error) {
 func CalculateSKI(pubKey crypto.PublicKey) ([]byte, error) {
 	pubBytes, err := x509.MarshalPKIXPublicKey(pubKey)
 	if err != nil {
-		return nil, fmt.Errorf("Ошибка маршалинга публичного ключа: %w", err)
+		return nil, fmt.Errorf("ошибка маршалинга публичного ключа: %w", err)
 	}
 	hash := cryptoutil.HashSHA1(pubBytes)
 	return hash[:], nil
@@ -97,20 +97,19 @@ func ParseDN(dn string) (*pkix.Name, error) {
 }
 
 func GenerateRootCATemplate(subjectDN string, pubKey crypto.PublicKey, validityDays int) (*x509.Certificate, error) {
-	// Парсим DN
 	name, err := ParseDN(subjectDN)
 	if err != nil {
-		return nil, fmt.Errorf("Ошибка парсинга subject: %w", err)
+		return nil, fmt.Errorf("ошибка парсинга subject: %w", err)
 	}
 
 	serialNumber, err := GenerateSerialNumber()
 	if err != nil {
-		return nil, fmt.Errorf("Ошибка генерации серийного номера: %w", err)
+		return nil, fmt.Errorf("ошибка генерации серийного номера: %w", err)
 	}
 
 	ski, err := CalculateSKI(pubKey)
 	if err != nil {
-		return nil, fmt.Errorf("Ошибка вычисления Subject Key Identifier: %w", err)
+		return nil, fmt.Errorf("ошибка вычисления subject key identifier: %w", err)
 	}
 
 	notBefore := time.Now().UTC()
@@ -138,7 +137,7 @@ func GenerateRootCATemplate(subjectDN string, pubKey crypto.PublicKey, validityD
 func CreateCertificatePEM(template *x509.Certificate, pubKey crypto.PublicKey, signer crypto.Signer) ([]byte, error) {
 	certDER, err := x509.CreateCertificate(rand.Reader, template, template, pubKey, signer)
 	if err != nil {
-		return nil, fmt.Errorf("Ошибка создания сертификата: %w", err)
+		return nil, fmt.Errorf("ошибка создания сертификата: %w", err)
 	}
 
 	certPEM := pem.EncodeToMemory(&pem.Block{
@@ -147,4 +146,8 @@ func CreateCertificatePEM(template *x509.Certificate, pubKey crypto.PublicKey, s
 	})
 
 	return certPEM, nil
+}
+
+func GetAKIFromCert(cert *x509.Certificate) []byte {
+	return cert.SubjectKeyId
 }
