@@ -15,9 +15,37 @@ import (
 	"MicroPKI/internal/chain"
 	"MicroPKI/internal/cryptoutil"
 	"MicroPKI/internal/csr"
+	"MicroPKI/internal/database"
 	"MicroPKI/internal/san"
 	"MicroPKI/internal/templates"
 )
+
+func setupTestDBForIntegration(t *testing.T) (*database.Database, func()) {
+	tmpDir, err := os.MkdirTemp("", "integration-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dbPath := filepath.Join(tmpDir, "test.db")
+	db, err := database.NewDatabase(dbPath)
+	if err != nil {
+		os.RemoveAll(tmpDir)
+		t.Fatal(err)
+	}
+
+	if err := db.InitSchema(); err != nil {
+		db.Close()
+		os.RemoveAll(tmpDir)
+		t.Fatal(err)
+	}
+
+	cleanup := func() {
+		db.Close()
+		os.RemoveAll(tmpDir)
+	}
+
+	return db, cleanup
+}
 
 func TestFullPKIChain(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "pki-integration-*")
@@ -25,6 +53,9 @@ func TestFullPKIChain(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(tmpDir)
+
+	db, cleanupDB := setupTestDBForIntegration(t)
+	defer cleanupDB()
 
 	rootPassFile := filepath.Join(tmpDir, "root.pass")
 	if err := os.WriteFile(rootPassFile, []byte("rootpass123\n"), 0600); err != nil {
@@ -39,6 +70,7 @@ func TestFullPKIChain(t *testing.T) {
 		tmpDir,
 		365,
 		false,
+		db,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -143,6 +175,7 @@ func TestFullPKIChain(t *testing.T) {
 		filepath.Join(tmpDir, "certs", "intermediate.cert.pem"),
 		filepath.Join(tmpDir, "private", "intermediate.key.pem"),
 		interPassFile,
+		db,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -205,6 +238,9 @@ func TestNegativeScenarios(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
+	db, cleanupDB := setupTestDBForIntegration(t)
+	defer cleanupDB()
+
 	rootPassFile := filepath.Join(tmpDir, "root.pass")
 	if err := os.WriteFile(rootPassFile, []byte("rootpass123\n"), 0600); err != nil {
 		t.Fatal(err)
@@ -218,6 +254,7 @@ func TestNegativeScenarios(t *testing.T) {
 		tmpDir,
 		365,
 		false,
+		db,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -311,46 +348,46 @@ func TestNegativeScenarios(t *testing.T) {
 	})
 
 	t.Run("csr_with_ca_true", func(t *testing.T) {
-	badKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatal(err)
-	}
+		badKey, err := rsa.GenerateKey(rand.Reader, 2048)
+		if err != nil {
+			t.Fatal(err)
+		}
 
-	serialNumber, _ := certs.GenerateSerialNumber()
-	ski, _ := certs.CalculateSKI(&badKey.PublicKey)
+		serialNumber, _ := certs.GenerateSerialNumber()
+		ski, _ := certs.CalculateSKI(&badKey.PublicKey)
 
-	template := &x509.Certificate{
-		SerialNumber: serialNumber,
-		Subject:      pkix.Name{CommonName: "Bad CSR"},
-		Issuer:       rootCert.Subject,
-		NotBefore:    rootCert.NotBefore,
-		NotAfter:     rootCert.NotAfter,
+		template := &x509.Certificate{
+			SerialNumber: serialNumber,
+			Subject:      pkix.Name{CommonName: "Bad CSR"},
+			Issuer:       rootCert.Subject,
+			NotBefore:    rootCert.NotBefore,
+			NotAfter:     rootCert.NotAfter,
 
-		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
-		BasicConstraintsValid: true,
-		IsCA:                  true,
+			KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+			BasicConstraintsValid: true,
+			IsCA:                  true,
 
-		SubjectKeyId:   ski,
-		AuthorityKeyId: rootCert.SubjectKeyId,
-	}
+			SubjectKeyId:   ski,
+			AuthorityKeyId: rootCert.SubjectKeyId,
+		}
 
-	certDER, err := x509.CreateCertificate(rand.Reader, template, rootCert, &badKey.PublicKey, rootKey)
-	if err != nil {
-		t.Fatalf("неожиданная ошибка при создании сертификата: %v", err)
-	}
+		certDER, err := x509.CreateCertificate(rand.Reader, template, rootCert, &badKey.PublicKey, rootKey)
+		if err != nil {
+			t.Fatalf("неожиданная ошибка при создании сертификата: %v", err)
+		}
 
-	cert, err := x509.ParseCertificate(certDER)
-	if err != nil {
-		t.Fatal(err)
-	}
+		cert, err := x509.ParseCertificate(certDER)
+		if err != nil {
+			t.Fatal(err)
+		}
 
-	if !cert.IsCA {
-		t.Error("сертификат должен быть CA")
-	}
+		if !cert.IsCA {
+			t.Error("сертификат должен быть CA")
+		}
 
-	err = cert.CheckSignatureFrom(rootCert)
-	if err != nil {
-		t.Error("подпись должна быть валидной")
-	}
-    })
+		err = cert.CheckSignatureFrom(rootCert)
+		if err != nil {
+			t.Error("подпись должна быть валидной")
+		}
+	})
 }

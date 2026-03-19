@@ -12,9 +12,22 @@ import (
 	"time"
 
 	"MicroPKI/internal/cryptoutil"
+	"MicroPKI/internal/database"
 )
 
+var serialGenerator *database.SerialGenerator
+
+func InitSerialGenerator(db *database.Database) {
+	if db != nil {
+		serialGenerator = database.NewSerialGenerator(db)
+	}
+}
+
 func GenerateSerialNumber() (*big.Int, error) {
+	if serialGenerator != nil {
+		return serialGenerator.GenerateSerialNumber()
+	}
+	
 	serialNumber := make([]byte, 20)
 	_, err := rand.Read(serialNumber)
 	if err != nil {
@@ -22,6 +35,16 @@ func GenerateSerialNumber() (*big.Int, error) {
 	}
 	return new(big.Int).SetBytes(serialNumber), nil
 }
+
+func ValidateSerialNumber(serial *big.Int, db *database.Database) (bool, error) {
+	if db == nil {
+		return true, nil
+	}
+	
+	sg := database.NewSerialGenerator(db)
+	return sg.ValidateSerialNumber(serial)
+}
+
 
 func CalculateSKI(pubKey crypto.PublicKey) ([]byte, error) {
 	pubBytes, err := x509.MarshalPKIXPublicKey(pubKey)

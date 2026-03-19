@@ -7,11 +7,13 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -20,7 +22,9 @@ import (
 	"MicroPKI/internal/chain"
 	"MicroPKI/internal/cryptoutil"
 	"MicroPKI/internal/csr"
+	"MicroPKI/internal/database"
 	"MicroPKI/internal/logger"
+	"MicroPKI/internal/repository"
 	"MicroPKI/internal/san"
 	"MicroPKI/internal/templates"
 )
@@ -35,6 +39,16 @@ var (
 	caCmd = &cobra.Command{
 		Use:   "ca",
 		Short: "Управление удостоверяющими центрами",
+	}
+
+	dbCmd = &cobra.Command{
+		Use:   "db",
+		Short: "Управление базой данных сертификатов",
+	}
+
+	repoCmd = &cobra.Command{
+		Use:   "repo",
+		Short: "Управление HTTP репозиторием",
 	}
 
 	caInitCmd = &cobra.Command{
@@ -61,6 +75,38 @@ var (
 		RunE:  runCAVerify,
 	}
 
+	caListCertsCmd = &cobra.Command{
+		Use:   "list-certs",
+		Short: "Список всех выпущенных сертификатов",
+		RunE:  runCAListCerts,
+	}
+
+	caShowCertCmd = &cobra.Command{
+		Use:   "show-cert [serial]",
+		Short: "Показать сертификат по серийному номеру",
+		Args:  cobra.ExactArgs(1),
+		RunE:  runCAShowCert,
+	}
+
+	dbInitCmd = &cobra.Command{
+		Use:   "init",
+		Short: "Инициализация базы данных сертификатов",
+		Long:  "Создает SQLite базу данных и необходимые таблицы для хранения сертификатов",
+		RunE:  runDBInit,
+	}
+
+	repornServeCmd = &cobra.Command{
+		Use:   "serve",
+		Short: "Запуск HTTP репозитория сертификатов",
+		RunE:  runRepoServe,
+	}
+
+	repoStatusCmd = &cobra.Command{
+		Use:   "status",
+		Short: "Проверка статуса HTTP репозитория",
+		RunE:  runRepoStatus,
+	}
+
 	subject         string
 	keyType         string
 	keySize         int
@@ -68,6 +114,7 @@ var (
 	outDir          string
 	validityDays    int
 	logFile         string
+	logJSON         string
 	force           bool
 
 	rootCert        string
@@ -81,14 +128,33 @@ var (
 	template        string
 	sanStrings      []string
 	csrFile         string
+
+	dbPath          string
+	
+	statusFilter    string
+	format          string
+	
+	host            string
+	port            int
+	certDir         string
 )
 
 func init() {
 	rootCmd.AddCommand(caCmd)
+	rootCmd.AddCommand(dbCmd)
+	rootCmd.AddCommand(repoCmd)
+	
 	caCmd.AddCommand(caInitCmd)
 	caCmd.AddCommand(caIssueIntermediateCmd)
 	caCmd.AddCommand(caIssueCertCmd)
 	caCmd.AddCommand(caVerifyCmd)
+	caCmd.AddCommand(caListCertsCmd)
+	caCmd.AddCommand(caShowCertCmd)
+	
+	dbCmd.AddCommand(dbInitCmd)
+	
+	repoCmd.AddCommand(repornServeCmd)
+	repoCmd.AddCommand(repoStatusCmd)
 
 	caInitCmd.Flags().StringVar(&subject, "subject", "", "Distinguished Name (e.g., /CN=My Root CA)")
 	caInitCmd.Flags().StringVar(&keyType, "key-type", "rsa", "Тип ключа: rsa или ecc")
@@ -97,7 +163,9 @@ func init() {
 	caInitCmd.Flags().StringVar(&outDir, "out-dir", "./pki", "Выходная директория")
 	caInitCmd.Flags().IntVar(&validityDays, "validity-days", 3650, "Срок действия в днях (по умолчанию 10 лет)")
 	caInitCmd.Flags().StringVar(&logFile, "log-file", "", "Файл для логов (по умолчанию stderr)")
+	caInitCmd.Flags().StringVar(&logJSON, "log-json", "", "Файл для JSON логов аудита")
 	caInitCmd.Flags().BoolVar(&force, "force", false, "Принудительная перезапись существующих файлов")
+	caInitCmd.Flags().StringVar(&dbPath, "db-path", "./pki/micropki.db", "Путь к SQLite базе данных")
 
 	caInitCmd.MarkFlagRequired("subject")
 	caInitCmd.MarkFlagRequired("passphrase-file")
@@ -113,7 +181,9 @@ func init() {
 	caIssueIntermediateCmd.Flags().IntVar(&validityDays, "validity-days", 1825, "Срок действия в днях (по умолчанию 5 лет)")
 	caIssueIntermediateCmd.Flags().IntVar(&pathlen, "pathlen", 0, "Ограничение длины пути")
 	caIssueIntermediateCmd.Flags().StringVar(&logFile, "log-file", "", "Файл для логов")
+	caIssueIntermediateCmd.Flags().StringVar(&logJSON, "log-json", "", "Файл для JSON логов аудита")
 	caIssueIntermediateCmd.Flags().BoolVar(&force, "force", false, "Принудительная перезапись")
+	caIssueIntermediateCmd.Flags().StringVar(&dbPath, "db-path", "./pki/micropki.db", "Путь к SQLite базе данных")
 
 	caIssueIntermediateCmd.MarkFlagRequired("root-cert")
 	caIssueIntermediateCmd.MarkFlagRequired("root-key")
@@ -131,7 +201,9 @@ func init() {
 	caIssueCertCmd.Flags().IntVar(&validityDays, "validity-days", 365, "Срок действия в днях")
 	caIssueCertCmd.Flags().StringVar(&csrFile, "csr", "", "Подписать внешний CSR (опционально)")
 	caIssueCertCmd.Flags().StringVar(&logFile, "log-file", "", "Файл для логов")
+	caIssueCertCmd.Flags().StringVar(&logJSON, "log-json", "", "Файл для JSON логов аудита")
 	caIssueCertCmd.Flags().BoolVar(&force, "force", false, "Принудительная перезапись")
+	caIssueCertCmd.Flags().StringVar(&dbPath, "db-path", "./pki/micropki.db", "Путь к SQLite базе данных")
 
 	caIssueCertCmd.MarkFlagRequired("ca-cert")
 	caIssueCertCmd.MarkFlagRequired("ca-key")
@@ -142,14 +214,62 @@ func init() {
 	caVerifyCmd.Flags().StringVar(&rootCert, "root", "", "Путь к корневому сертификату")
 	caVerifyCmd.Flags().StringVar(&caCert, "intermediate", "", "Путь к промежуточному сертификату")
 	caVerifyCmd.Flags().StringVar(&outDir, "leaf", "", "Путь к конечному сертификату")
+	caVerifyCmd.Flags().StringVar(&logFile, "log-file", "", "Файл для логов")
+	caVerifyCmd.Flags().StringVar(&logJSON, "log-json", "", "Файл для JSON логов аудита")
 
 	caVerifyCmd.MarkFlagRequired("root")
 	caVerifyCmd.MarkFlagRequired("intermediate")
 	caVerifyCmd.MarkFlagRequired("leaf")
+
+	dbInitCmd.Flags().StringVar(&dbPath, "db-path", "./pki/micropki.db", "Путь к SQLite базе данных")
+	dbInitCmd.Flags().StringVar(&logFile, "log-file", "", "Файл для логов")
+	dbInitCmd.Flags().StringVar(&logJSON, "log-json", "", "Файл для JSON логов аудита")
+	dbInitCmd.Flags().BoolVar(&force, "force", false, "Принудительная перезапись (удалить существующую БД)")
+
+	caListCertsCmd.Flags().StringVar(&dbPath, "db-path", "./pki/micropki.db", "Путь к SQLite базе данных")
+	caListCertsCmd.Flags().StringVar(&statusFilter, "status", "", "Фильтр по статусу (valid, revoked, expired)")
+	caListCertsCmd.Flags().StringVar(&format, "format", "table", "Формат вывода (table, json, csv)")
+	caListCertsCmd.Flags().StringVar(&logFile, "log-file", "", "Файл для логов")
+	caListCertsCmd.Flags().StringVar(&logJSON, "log-json", "", "Файл для JSON логов аудита")
+
+	caShowCertCmd.Flags().StringVar(&dbPath, "db-path", "./pki/micropki.db", "Путь к SQLite базе данных")
+	caShowCertCmd.Flags().StringVar(&logFile, "log-file", "", "Файл для логов")
+	caShowCertCmd.Flags().StringVar(&logJSON, "log-json", "", "Файл для JSON логов аудита")
+
+	repornServeCmd.Flags().StringVar(&host, "host", "127.0.0.1", "Адрес для привязки сервера")
+	repornServeCmd.Flags().IntVar(&port, "port", 8080, "TCP порт")
+	repornServeCmd.Flags().StringVar(&dbPath, "db-path", "./pki/micropki.db", "Путь к SQLite базе данных")
+	repornServeCmd.Flags().StringVar(&certDir, "cert-dir", "./pki/certs", "Директория с PEM сертификатами")
+	repornServeCmd.Flags().StringVar(&logFile, "log-file", "", "Файл для логов")
+	repornServeCmd.Flags().StringVar(&logJSON, "log-json", "", "Файл для JSON логов аудита")
+
+	repoStatusCmd.Flags().StringVar(&host, "host", "127.0.0.1", "Адрес сервера")
+	repoStatusCmd.Flags().IntVar(&port, "port", 8080, "TCP порт")
+	repoStatusCmd.Flags().StringVar(&logFile, "log-file", "", "Файл для логов")
+	repoStatusCmd.Flags().StringVar(&logJSON, "log-json", "", "Файл для JSON логов аудита")
+}
+
+func openDatabase(dbPath string) (*database.Database, error) {
+	db, err := database.NewDatabase(dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка открытия БД: %w", err)
+	}
+	
+	initialized, err := db.IsInitialized()
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("ошибка проверки БД: %w", err)
+	}
+	
+	if !initialized {
+		logger.Warn("БД не инициализирована. Запустите 'micropki db init'")
+	}
+	
+	return db, nil
 }
 
 func runCAInit(cmd *cobra.Command, args []string) error {
-	if err := logger.Init(logFile); err != nil {
+	if err := logger.Init(logFile, logJSON); err != nil {
 		return fmt.Errorf("ошибка инициализации логгера: %w", err)
 	}
 	defer logger.Close()
@@ -166,6 +286,18 @@ func runCAInit(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	var db *database.Database
+	if dbPath != "" {
+		var err error
+		db, err = openDatabase(dbPath)
+		if err != nil {
+			logger.Warn("не удалось открыть БД: %v", err)
+		} else {
+			defer db.Close()
+			certs.InitSerialGenerator(db)
+		}
+	}
+
 	rootCA, err := ca.NewRootCA(
 		subject,
 		keyType,
@@ -174,6 +306,7 @@ func runCAInit(cmd *cobra.Command, args []string) error {
 		outDir,
 		validityDays,
 		force,
+		db,
 	)
 	if err != nil {
 		logger.Error("ошибка создания корневого УЦ: %v", err)
@@ -183,6 +316,19 @@ func runCAInit(cmd *cobra.Command, args []string) error {
 	if err := rootCA.Initialize(); err != nil {
 		logger.Error("ошибка инициализации УЦ: %v", err)
 		return fmt.Errorf("ошибка инициализации УЦ: %w", err)
+	}
+
+	if logJSON != "" {
+		auditData := map[string]interface{}{
+			"action":       "root_ca_init",
+			"subject":      subject,
+			"key_type":     keyType,
+			"key_size":     keySize,
+			"out_dir":      outDir,
+			"validity_days": validityDays,
+			"timestamp":    time.Now().UTC().Format(time.RFC3339),
+		}
+		logger.AuditJSON("root_ca_created", auditData)
 	}
 
 	logger.Info("корневой УЦ успешно создан в директории: %s", outDir)
@@ -195,7 +341,7 @@ func runCAInit(cmd *cobra.Command, args []string) error {
 }
 
 func runCAIssueIntermediate(cmd *cobra.Command, args []string) error {
-	if err := logger.Init(logFile); err != nil {
+	if err := logger.Init(logFile, logJSON); err != nil {
 		return fmt.Errorf("ошибка инициализации логгера: %w", err)
 	}
 	defer logger.Close()
@@ -205,6 +351,18 @@ func runCAIssueIntermediate(cmd *cobra.Command, args []string) error {
 	if err := validateIntermediateParams(); err != nil {
 		logger.Error("%v", err)
 		return err
+	}
+
+	var db *database.Database
+	if dbPath != "" {
+		var err error
+		db, err = openDatabase(dbPath)
+		if err != nil {
+			logger.Warn("не удалось открыть БД: %v", err)
+		} else {
+			defer db.Close()
+			certs.InitSerialGenerator(db)
+		}
 	}
 
 	rootPass, err := os.ReadFile(rootPassFile)
@@ -371,19 +529,76 @@ func runCAIssueIntermediate(cmd *cobra.Command, args []string) error {
 		Bytes: certDER,
 	})
 
-	certPath := filepath.Join(certsDir, "intermediate.cert.pem")
-	if err := os.WriteFile(certPath, certPEM, 0644); err != nil {
-		return fmt.Errorf("ошибка сохранения сертификата: %w", err)
+	tempCertPath := filepath.Join(certsDir, ".intermediate.cert.pem.tmp")
+	if err := os.WriteFile(tempCertPath, certPEM, 0644); err != nil {
+		return fmt.Errorf("ошибка сохранения временного сертификата: %w", err)
 	}
-	logger.Info("сертификат промежуточного УЦ сохранен: %s", certPath)
+
+	finalCert, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		os.Remove(tempCertPath)
+		return fmt.Errorf("ошибка парсинга созданного сертификата: %w", err)
+	}
+
+	if db != nil {
+		tx, err := db.BeginTx()
+		if err != nil {
+			os.Remove(tempCertPath)
+			return fmt.Errorf("ошибка начала транзакции БД: %w", err)
+		}
+
+		if err := db.InsertCertificateTx(tx, finalCert, certPEM, "valid"); err != nil {
+			tx.Rollback()
+			os.Remove(tempCertPath)
+			logger.Error("ошибка вставки промежуточного сертификата в БД: %v", err)
+			return fmt.Errorf("ошибка вставки в БД: %w", err)
+		}
+
+		if err := tx.Commit(); err != nil {
+			tx.Rollback()
+			os.Remove(tempCertPath)
+			return fmt.Errorf("ошибка коммита транзакции: %w", err)
+		}
+
+		certPath := filepath.Join(certsDir, "intermediate.cert.pem")
+		if err := os.Rename(tempCertPath, certPath); err != nil {
+			logger.Error("КРИТИЧЕСКАЯ ОШИБКА: сертификат в БД, но файл не сохранен: %v", err)
+			if err := os.WriteFile(certPath, certPEM, 0644); err != nil {
+				return fmt.Errorf("катастрофическая ошибка: сертификат только в БД")
+			}
+		}
+		logger.Info("промежуточный сертификат сохранен в БД и на диск")
+	} else {
+		certPath := filepath.Join(certsDir, "intermediate.cert.pem")
+		if err := os.Rename(tempCertPath, certPath); err != nil {
+			os.Remove(tempCertPath)
+			return fmt.Errorf("ошибка сохранения сертификата: %w", err)
+		}
+		logger.Info("сертификат промежуточного УЦ сохранен: %s", certPath)
+	}
 
 	if err := updatePolicyWithIntermediate(outDir, subject, serialNumber, notBefore, notAfter, keyType, keySize, pathlen, rootCertificate.Subject.String()); err != nil {
 		logger.Warn("ошибка обновления policy.txt: %v", err)
 	}
 
+	if logJSON != "" {
+		auditData := map[string]interface{}{
+			"action":        "intermediate_ca_issued",
+			"subject":       subject,
+			"serial_number": fmt.Sprintf("%x", serialNumber),
+			"issuer":        rootCertificate.Subject.String(),
+			"key_type":      keyType,
+			"key_size":      keySize,
+			"pathlen":       pathlen,
+			"validity_days": validityDays,
+			"timestamp":     time.Now().UTC().Format(time.RFC3339),
+		}
+		logger.AuditJSON("intermediate_ca_created", auditData)
+	}
+
 	logger.Info("промежуточный УЦ успешно создан")
 	fmt.Printf("\nПромежуточный УЦ успешно создан!\n")
-	fmt.Printf("   Сертификат: %s\n", certPath)
+	fmt.Printf("   Сертификат: %s\n", filepath.Join(certsDir, "intermediate.cert.pem"))
 	fmt.Printf("   Ключ: %s\n", filepath.Join(privateDir, "intermediate.key.pem"))
 	fmt.Printf("   CSR: %s\n", csrPath)
 	
@@ -391,7 +606,7 @@ func runCAIssueIntermediate(cmd *cobra.Command, args []string) error {
 }
 
 func runCAIssueCert(cmd *cobra.Command, args []string) error {
-	if err := logger.Init(logFile); err != nil {
+	if err := logger.Init(logFile, logJSON); err != nil {
 		return fmt.Errorf("ошибка инициализации логгера: %w", err)
 	}
 	defer logger.Close()
@@ -401,6 +616,18 @@ func runCAIssueCert(cmd *cobra.Command, args []string) error {
 	if err := validateIssueCertParams(); err != nil {
 		logger.Error("%v", err)
 		return err
+	}
+
+	var db *database.Database
+	if dbPath != "" {
+		var err error
+		db, err = openDatabase(dbPath)
+		if err != nil {
+			logger.Warn("не удалось открыть БД: %v", err)
+		} else {
+			defer db.Close()
+			certs.InitSerialGenerator(db)
+		}
 	}
 
 	templateType := templates.TemplateType(template)
@@ -470,6 +697,7 @@ func runCAIssueCert(cmd *cobra.Command, args []string) error {
 
 	var pubKey crypto.PublicKey
 	var commonName string
+	var keyPath string
 
 	if csrFile != "" {
 		logger.Info("подписание внешнего CSR: %s", csrFile)
@@ -503,7 +731,7 @@ func runCAIssueCert(cmd *cobra.Command, args []string) error {
 		}
 		pubKey = &key.PublicKey
 
-		keyPath := filepath.Join(outDir, commonName+".key.pem")
+		keyPath = filepath.Join(outDir, commonName+".key.pem")
 		keyPEM := pem.EncodeToMemory(&pem.Block{
 			Type:  "RSA PRIVATE KEY",
 			Bytes: x509.MarshalPKCS1PrivateKey(key),
@@ -542,15 +770,86 @@ func runCAIssueCert(cmd *cobra.Command, args []string) error {
 		Bytes: certDER,
 	})
 
-	certPath := filepath.Join(outDir, commonName+".cert.pem")
-	if err := os.WriteFile(certPath, certPEM, 0644); err != nil {
-		return fmt.Errorf("ошибка сохранения сертификата: %w", err)
+	tempCertPath := filepath.Join(outDir, "."+commonName+".cert.pem.tmp")
+	if err := os.WriteFile(tempCertPath, certPEM, 0644); err != nil {
+		if keyPath != "" {
+			os.Remove(keyPath)
+		}
+		return fmt.Errorf("ошибка сохранения временного сертификата: %w", err)
 	}
-	logger.Info("сертификат сохранен: %s", certPath)
+	logger.Info("временный сертификат сохранен: %s", tempCertPath)
 
 	finalCert, err := x509.ParseCertificate(certDER)
 	if err != nil {
+		os.Remove(tempCertPath)
+		if keyPath != "" {
+			os.Remove(keyPath)
+		}
 		return fmt.Errorf("ошибка парсинга созданного сертификата: %w", err)
+	}
+
+	if db != nil {
+		tx, err := db.BeginTx()
+		if err != nil {
+			os.Remove(tempCertPath)
+			if keyPath != "" {
+				os.Remove(keyPath)
+			}
+			return fmt.Errorf("ошибка начала транзакции БД: %w", err)
+		}
+		
+		if err := db.InsertCertificateTx(tx, finalCert, certPEM, "valid"); err != nil {
+			tx.Rollback()
+			os.Remove(tempCertPath)
+			if keyPath != "" {
+				os.Remove(keyPath)
+			}
+			logger.Error("ошибка вставки сертификата в БД: %v", err)
+			return fmt.Errorf("ошибка сохранения в БД, операция отменена: %w", err)
+		}
+		
+		if err := tx.Commit(); err != nil {
+			tx.Rollback()
+			os.Remove(tempCertPath)
+			if keyPath != "" {
+				os.Remove(keyPath)
+			}
+			return fmt.Errorf("ошибка коммита транзакции: %w", err)
+		}
+		
+		certPath := filepath.Join(outDir, commonName+".cert.pem")
+		if err := os.Rename(tempCertPath, certPath); err != nil {
+			logger.Error("КРИТИЧЕСКАЯ ОШИБКА: сертификат в БД, но файл не сохранен: %v", err)
+			if err := os.WriteFile(certPath, certPEM, 0644); err != nil {
+				return fmt.Errorf("катастрофическая ошибка: сертификат только в БД: %w", err)
+			}
+		}
+		
+		logger.Info("сертификат сохранен в БД и на диск: %s", certPath)
+		
+		if logJSON != "" {
+			auditData := map[string]interface{}{
+				"action":        "certificate_issued",
+				"serial_number": fmt.Sprintf("%x", finalCert.SerialNumber),
+				"subject":       subject,
+				"template":      template,
+				"sans":          sanStrings,
+				"issuer":        caCertificate.Subject.String(),
+				"validity_days": validityDays,
+				"timestamp":     time.Now().UTC().Format(time.RFC3339),
+			}
+			logger.AuditJSON("certificate_issued", auditData)
+		}
+	} else {
+		certPath := filepath.Join(outDir, commonName+".cert.pem")
+		if err := os.Rename(tempCertPath, certPath); err != nil {
+			os.Remove(tempCertPath)
+			if keyPath != "" {
+				os.Remove(keyPath)
+			}
+			return fmt.Errorf("ошибка сохранения сертификата: %w", err)
+		}
+		logger.Info("сертификат сохранен (без БД): %s", certPath)
 	}
 
 	logger.Info("сертификат успешно выпущен: серийный номер %x, шаблон %s, subject %s",
@@ -558,16 +857,17 @@ func runCAIssueCert(cmd *cobra.Command, args []string) error {
 	logger.Audit(finalCert.SerialNumber.String(), subject, template)
 
 	fmt.Printf("\nСертификат успешно выпущен!\n")
-	fmt.Printf("   Сертификат: %s\n", certPath)
+	fmt.Printf("   Сертификат: %s\n", filepath.Join(outDir, commonName+".cert.pem"))
 	if csrFile == "" {
-		fmt.Printf("   Ключ: %s\n", filepath.Join(outDir, commonName+".key.pem"))
+		fmt.Printf("   Ключ: %s\n", keyPath)
 	}
+	fmt.Printf("   Серийный номер: %x\n", finalCert.SerialNumber)
 	
 	return nil
 }
 
 func runCAVerify(cmd *cobra.Command, args []string) error {
-	if err := logger.Init(logFile); err != nil {
+	if err := logger.Init(logFile, logJSON); err != nil {
 		return fmt.Errorf("ошибка инициализации логгера: %w", err)
 	}
 	defer logger.Close()
@@ -590,6 +890,258 @@ func runCAVerify(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+func runDBInit(cmd *cobra.Command, args []string) error {
+	if err := logger.Init(logFile, logJSON); err != nil {
+		return fmt.Errorf("ошибка инициализации логгера: %w", err)
+	}
+	defer logger.Close()
+
+	logger.Info("инициализация базы данных: %s", dbPath)
+
+	if _, err := os.Stat(dbPath); err == nil && !force {
+		logger.Info("БД уже существует, пробуем применить миграции")
+		
+		db, err := database.NewDatabase(dbPath)
+		if err != nil {
+			return fmt.Errorf("ошибка открытия БД: %w", err)
+		}
+		defer db.Close()
+		
+		if err := db.ApplyMigrations(); err != nil {
+			return fmt.Errorf("ошибка применения миграций: %w", err)
+		}
+		
+		logger.Info("миграции успешно применены к существующей БД")
+		fmt.Printf("Миграции успешно применены к БД: %s\n", dbPath)
+		return nil
+	}
+
+	if force {
+		if _, err := os.Stat(dbPath); err == nil {
+			if err := os.Remove(dbPath); err != nil {
+				return fmt.Errorf("ошибка удаления существующей БД: %w", err)
+			}
+			logger.Info("существующая БД удалена")
+		}
+		os.Remove(dbPath + "-journal")
+		os.Remove(dbPath + "-wal")
+		os.Remove(dbPath + "-shm")
+	}
+
+	db, err := database.NewDatabase(dbPath)
+	if err != nil {
+		logger.Error("ошибка создания БД: %v", err)
+		return fmt.Errorf("ошибка создания БД: %w", err)
+	}
+	defer db.Close()
+
+	if err := db.InitSchema(); err != nil {
+		logger.Error("ошибка инициализации схемы: %v", err)
+		return fmt.Errorf("ошибка инициализации схемы: %w", err)
+	}
+
+	initialized, err := db.IsInitialized()
+	if err != nil {
+		return fmt.Errorf("ошибка проверки инициализации: %w", err)
+	}
+	if !initialized {
+		return fmt.Errorf("схема не была создана")
+	}
+
+	if logJSON != "" {
+		auditData := map[string]interface{}{
+			"action":    "db_init",
+			"db_path":   dbPath,
+			"force":     force,
+			"timestamp": time.Now().UTC().Format(time.RFC3339),
+		}
+		logger.AuditJSON("database_initialized", auditData)
+	}
+
+	logger.Info("база данных успешно инициализирована: %s", dbPath)
+	fmt.Printf("\nБаза данных успешно создана: %s\n", dbPath)
+	return nil
+}
+
+func runCAListCerts(cmd *cobra.Command, args []string) error {
+	if err := logger.Init(logFile, logJSON); err != nil {
+		return fmt.Errorf("ошибка инициализации логгера: %w", err)
+	}
+	defer logger.Close()
+
+	db, err := openDatabase(dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	records, err := db.ListCertificates(statusFilter, "", 0)
+	if err != nil {
+		logger.Error("ошибка получения списка сертификатов: %v", err)
+		return fmt.Errorf("ошибка получения списка сертификатов: %w", err)
+	}
+
+	switch format {
+	case "json":
+		printJSON(records)
+	case "csv":
+		printCSV(records)
+	case "table":
+		printTable(records)
+	default:
+		return fmt.Errorf("неподдерживаемый формат: %s", format)
+	}
+
+	logger.Info("выведено %d сертификатов", len(records))
+	return nil
+}
+
+func runCAShowCert(cmd *cobra.Command, args []string) error {
+	if err := logger.Init(logFile, logJSON); err != nil {
+		return fmt.Errorf("ошибка инициализации логгера: %w", err)
+	}
+	defer logger.Close()
+
+	serial := args[0]
+	logger.Info("поиск сертификата по серийному номеру: %s", serial)
+
+	db, err := openDatabase(dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	record, err := db.GetCertificateBySerial(serial)
+	if err != nil {
+		logger.Error("ошибка получения сертификата: %v", err)
+		return fmt.Errorf("ошибка получения сертификата: %w", err)
+	}
+
+	if record == nil {
+		logger.Info("сертификат с серийным номером %s не найден", serial)
+		return fmt.Errorf("сертификат с серийным номером %s не найден", serial)
+	}
+
+	fmt.Print(record.CertPEM)
+	logger.Info("сертификат выведен: serial=%s", serial)
+	return nil
+}
+
+func runRepoServe(cmd *cobra.Command, args []string) error {
+	if err := logger.Init(logFile, logJSON); err != nil {
+		return fmt.Errorf("ошибка инициализации логгера: %w", err)
+	}
+	defer logger.Close()
+
+	logger.Info("запуск HTTP сервера на %s:%d", host, port)
+	logger.Info("БД: %s", dbPath)
+	logger.Info("директория с сертификатами: %s", certDir)
+
+	db, err := openDatabase(dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	server := repository.NewServer(host, port, db, certDir)
+	
+	fmt.Printf("HTTP сервер запущен на %s:%d\n", host, port)
+	fmt.Printf("  - GET  /certificate/{serial} - получить сертификат по серийному номеру\n")
+	fmt.Printf("  - GET  /ca/root               - получить корневой сертификат CA\n")
+	fmt.Printf("  - GET  /ca/intermediate        - получить промежуточный сертификат CA\n")
+	fmt.Printf("  - GET  /crl                    - получить CRL\n")
+	fmt.Printf("  - GET  /health                 - проверка работоспособности\n")
+	fmt.Printf("\nДля остановки нажмите Ctrl+C\n")
+
+	if err := server.Start(); err != nil {
+		logger.Error("ошибка работы сервера: %v", err)
+		return fmt.Errorf("ошибка работы сервера: %w", err)
+	}
+
+	return nil
+}
+
+func runRepoStatus(cmd *cobra.Command, args []string) error {
+	if err := logger.Init(logFile, logJSON); err != nil {
+		return fmt.Errorf("ошибка инициализации логгера: %w", err)
+	}
+	defer logger.Close()
+
+	address := fmt.Sprintf("%s:%d", host, port)
+	
+	if repository.IsRunning(host, port) {
+		fmt.Printf("Сервер запущен на %s\n", address)
+		logger.Info("сервер запущен на %s", address)
+	} else {
+		fmt.Printf("Сервер не запущен на %s\n", address)
+		logger.Info("сервер не запущен на %s", address)
+	}
+
+	return nil
+}
+
+func printJSON(records []*database.CertificateRecord) {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	enc.Encode(records)
+}
+
+func printCSV(records []*database.CertificateRecord) {
+	fmt.Println("Serial,Subject,Issuer,NotBefore,NotAfter,Status")
+	for _, r := range records {
+		fmt.Printf("%s,%s,%s,%s,%s,%s\n",
+			r.SerialHex,
+			escapeCSV(r.Subject),
+			escapeCSV(r.Issuer),
+			r.NotBefore.Format("2006-01-02"),
+			r.NotAfter.Format("2006-01-02"),
+			r.Status,
+		)
+	}
+}
+
+func escapeCSV(s string) string {
+	return strings.ReplaceAll(s, ",", ";")
+}
+
+func printTable(records []*database.CertificateRecord) {
+	if len(records) == 0 {
+		fmt.Println("Нет сертификатов")
+		return
+	}
+
+	fmt.Printf("%-20s %-30s %-30s %-12s %-12s %-10s\n",
+		"SERIAL", "SUBJECT", "ISSUER", "NOT BEFORE", "NOT AFTER", "STATUS")
+	fmt.Println(strings.Repeat("-", 120))
+
+	for _, r := range records {
+		subject := r.Subject
+		if len(subject) > 30 {
+			subject = subject[:27] + "..."
+		}
+		issuer := r.Issuer
+		if len(issuer) > 30 {
+			issuer = issuer[:27] + "..."
+		}
+
+		fmt.Printf("%-20s %-30s %-30s %-12s %-12s %-10s\n",
+			truncate(r.SerialHex, 20),
+			truncate(subject, 30),
+			truncate(issuer, 30),
+			r.NotBefore.Format("2006-01-02"),
+			r.NotAfter.Format("2006-01-02"),
+			r.Status,
+		)
+	}
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n-3] + "..."
 }
 
 func validateCAInitParams() error {

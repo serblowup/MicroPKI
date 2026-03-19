@@ -1,10 +1,12 @@
 package logger
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -13,9 +15,11 @@ var (
 	warnLogger  *log.Logger
 	errorLogger *log.Logger
 	logFile     *os.File
+	jsonLogger  *log.Logger
+	jsonLogFile *os.File
 )
 
-func Init(logFilePath string) error {
+func Init(logFilePath string, jsonLogPath string) error {
 	var writer io.Writer
 
 	if logFilePath != "" {
@@ -33,12 +37,24 @@ func Init(logFilePath string) error {
 	warnLogger = log.New(writer, "", 0)
 	errorLogger = log.New(writer, "", 0)
 
+	if jsonLogPath != "" {
+		file, err := os.OpenFile(jsonLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			return fmt.Errorf("ошибка открытия файла JSON лога: %w", err)
+		}
+		jsonLogFile = file
+		jsonLogger = log.New(file, "", 0)
+	}
+
 	return nil
 }
 
 func Close() {
 	if logFile != nil {
 		logFile.Close()
+	}
+	if jsonLogFile != nil {
+		jsonLogFile.Close()
 	}
 }
 
@@ -85,16 +101,76 @@ func Audit(serial, subject, template string) {
 	}
 }
 
+type JSONLogEntry struct {
+	Timestamp string      `json:"timestamp"`
+	Level     string      `json:"level"`
+	Message   string      `json:"message"`
+	Data      interface{} `json:"data,omitempty"`
+}
+
+func AuditJSON(action string, data map[string]interface{}) {
+	if jsonLogger == nil {
+		return
+	}
+	
+	entry := JSONLogEntry{
+		Timestamp: time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
+		Level:     "AUDIT",
+		Message:   action,
+		Data:      data,
+	}
+	
+	jsonBytes, err := json.Marshal(entry)
+	if err != nil {
+		Error("ошибка маршалинга JSON лога: %v", err)
+		return
+	}
+	
+	jsonLogger.Println(string(jsonBytes))
+}
+
 func containsPassphrase(msg string) bool {
-	sensitive := []string{"pass", "password", "passphrase", "pwd", "secret"}
+	patterns := []struct {
+		pattern string
+		context bool
+	}{
+		{"passphrase", true},
+		{"password", true},
+		{"pwd", true},
+		{"secret", true},
+		{"pass:", false},
+		{"pass=", false},
+	}
+	
 	msgLower := stringsToLower(msg)
 	
-	for _, s := range sensitive {
-		if stringsContains(msgLower, s) {
-			return true
+	for _, p := range patterns {
+		if !stringsContains(msgLower, p.pattern) {
+			continue
 		}
+		
+		if p.context {
+			idx := strings.Index(msgLower, p.pattern)
+			if idx > 0 {
+				prevChar := msgLower[idx-1]
+				nextIdx := idx + len(p.pattern)
+				if nextIdx < len(msgLower) {
+					nextChar := msgLower[nextIdx]
+					if isLetter(prevChar) && isLetter(nextChar) {
+						continue
+					}
+				}
+			}
+		}
+		
+		return true
 	}
+	
 	return false
+}
+
+func isLetter(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
 }
 
 func stringsToLower(s string) string {

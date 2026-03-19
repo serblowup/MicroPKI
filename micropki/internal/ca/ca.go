@@ -15,6 +15,7 @@ import (
 
 	"MicroPKI/internal/certs"
 	"MicroPKI/internal/cryptoutil"
+	"MicroPKI/internal/database"
 	"MicroPKI/internal/logger"
 )
 
@@ -26,6 +27,7 @@ type RootCA struct {
 	OutDir         string
 	ValidityDays   int
 	Force          bool
+	DB             *database.Database
 
 	privateKey  crypto.PrivateKey
 	certificate *x509.Certificate
@@ -36,9 +38,10 @@ type IntermediateCA struct {
 	CertPath       string
 	KeyPath        string
 	PassphraseFile string
+	DB             *database.Database
 }
 
-func NewRootCA(subject, keyType string, keySize int, passphraseFile, outDir string, validityDays int, force bool) (*RootCA, error) {
+func NewRootCA(subject, keyType string, keySize int, passphraseFile, outDir string, validityDays int, force bool, db *database.Database) (*RootCA, error) {
 	if subject == "" {
 		return nil, fmt.Errorf("subject не может быть пустым")
 	}
@@ -63,10 +66,11 @@ func NewRootCA(subject, keyType string, keySize int, passphraseFile, outDir stri
 		OutDir:         outDir,
 		ValidityDays:   validityDays,
 		Force:          force,
+		DB:             db,
 	}, nil
 }
 
-func NewIntermediateCA(certPath, keyPath, passphraseFile string) (*IntermediateCA, error) {
+func NewIntermediateCA(certPath, keyPath, passphraseFile string, db *database.Database) (*IntermediateCA, error) {
 	if _, err := os.Stat(certPath); err != nil {
 		return nil, fmt.Errorf("сертификат промежуточного УЦ не найден: %w", err)
 	}
@@ -81,6 +85,7 @@ func NewIntermediateCA(certPath, keyPath, passphraseFile string) (*IntermediateC
 		CertPath:       certPath,
 		KeyPath:        keyPath,
 		PassphraseFile: passphraseFile,
+		DB:             db, // НОВОЕ
 	}, nil
 }
 
@@ -135,6 +140,15 @@ func (ca *RootCA) Initialize() error {
 		return err
 	}
 	logger.Info("сертификат сохранен")
+
+	if ca.DB != nil {
+		logger.Info("сохранение корневого сертификата в БД")
+		if err := ca.DB.InsertCertificate(ca.certificate, ca.certPEM, "valid"); err != nil {
+			logger.Error("ошибка вставки сертификата в БД: %v", err)
+		} else {
+			logger.Info("корневой сертификат сохранен в БД")
+		}
+	}
 
 	logger.Info("проверка соответствия ключа и сертификата...")
 	if err := ca.verifyKeyPair(); err != nil {
@@ -343,4 +357,11 @@ func (ica *IntermediateCA) Load() (*x509.Certificate, crypto.Signer, error) {
 	}
 
 	return cert, signer, nil
+}
+
+func SaveCertificateToDB(db *database.Database, cert *x509.Certificate, certPEM []byte, status string) error {
+	if db == nil {
+		return fmt.Errorf("БД не инициализирована")
+	}
+	return db.InsertCertificate(cert, certPEM, status)
 }

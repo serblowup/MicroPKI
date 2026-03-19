@@ -29,7 +29,7 @@ node_modules/
 ehthumbs.db
 Thumbs.db
 
-# PKI директории (игнорируем сгенерированные сертификаты и ключи)
+# PKI директории
 /pki/
 /micropki/pki/
 *.pem
@@ -40,9 +40,27 @@ Thumbs.db
 secrets/
 /micropki/secrets/
 
+# БД
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+/pki/*.db
+/micropki/pki/*.db
+/micropki/*.db
+
 # Логи
 *.log
 /micropki/*.log
+/http-*.log
+/repository-*.log
+
+# Файлы конфигурации
+/config.yaml
+/config.yml
+/config.json
+/micropki/config.yaml
+/micropki/micropki.conf
 
 # Файлы Go workspace
 go.work
@@ -60,3 +78,5 @@ coverage.html
 # Временные файлы
 tmp/
 /micropki/tmp/
+/test-*.db
+/test-certs/

@@ -13,7 +13,35 @@ import (
 	"MicroPKI/internal/certs"
 	"MicroPKI/internal/cryptoutil"
 	"MicroPKI/internal/csr"
+	"MicroPKI/internal/database"
 )
+
+func setupTestDBForCA(t *testing.T) (*database.Database, func()) {
+	tmpDir, err := os.MkdirTemp("", "ca-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dbPath := filepath.Join(tmpDir, "test.db")
+	db, err := database.NewDatabase(dbPath)
+	if err != nil {
+		os.RemoveAll(tmpDir)
+		t.Fatal(err)
+	}
+
+	if err := db.InitSchema(); err != nil {
+		db.Close()
+		os.RemoveAll(tmpDir)
+		t.Fatal(err)
+	}
+
+	cleanup := func() {
+		db.Close()
+		os.RemoveAll(tmpDir)
+	}
+
+	return db, cleanup
+}
 
 func TestRootCAInitialization(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "pki-test-*")
@@ -21,6 +49,9 @@ func TestRootCAInitialization(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(tmpDir)
+
+	db, cleanupDB := setupTestDBForCA(t)
+	defer cleanupDB()
 
 	passFile := filepath.Join(tmpDir, "test.pass")
 	if err := os.WriteFile(passFile, []byte("testpass123\n"), 0600); err != nil {
@@ -35,6 +66,7 @@ func TestRootCAInitialization(t *testing.T) {
 		tmpDir,
 		365,
 		false,
+		db,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -64,6 +96,9 @@ func TestECCRootCAInitialization(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
+	db, cleanupDB := setupTestDBForCA(t)
+	defer cleanupDB()
+
 	passFile := filepath.Join(tmpDir, "test.pass")
 	if err := os.WriteFile(passFile, []byte("testpass123\n"), 0600); err != nil {
 		t.Fatal(err)
@@ -77,6 +112,7 @@ func TestECCRootCAInitialization(t *testing.T) {
 		tmpDir,
 		365,
 		false,
+		db,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -97,6 +133,9 @@ func TestKeyCertMatching(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
+	db, cleanupDB := setupTestDBForCA(t)
+	defer cleanupDB()
+
 	privateDir := filepath.Join(tmpDir, "private")
 	if err := os.MkdirAll(privateDir, 0700); err != nil {
 		t.Fatal(err)
@@ -116,6 +155,7 @@ func TestKeyCertMatching(t *testing.T) {
 		tmpDir,
 		365,
 		false,
+		db,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -144,6 +184,9 @@ func TestIntermediateCA(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
+	db, cleanupDB := setupTestDBForCA(t)
+	defer cleanupDB()
+
 	rootPassFile := filepath.Join(tmpDir, "root.pass")
 	if err := os.WriteFile(rootPassFile, []byte("rootpass123\n"), 0600); err != nil {
 		t.Fatal(err)
@@ -157,6 +200,7 @@ func TestIntermediateCA(t *testing.T) {
 		tmpDir,
 		365,
 		false,
+		db,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -274,6 +318,7 @@ func TestIntermediateCA(t *testing.T) {
 		interCertPath,
 		filepath.Join(tmpDir, "private", "intermediate.key.pem"),
 		interPassFile,
+		db,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -299,6 +344,9 @@ func TestNegativeCases(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(tmpDir)
+
+	db, cleanupDB := setupTestDBForCA(t)
+	defer cleanupDB()
 
 	passFile := filepath.Join(tmpDir, "test.pass")
 	if err := os.WriteFile(passFile, []byte("testpass123\n"), 0600); err != nil {
@@ -380,6 +428,7 @@ func TestNegativeCases(t *testing.T) {
 				tmpDir,
 				tt.validity,
 				false,
+				db,
 			)
 			if err != nil {
 				if !tt.expectError {
@@ -448,6 +497,9 @@ func TestCertificateVerification(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
+	db, cleanupDB := setupTestDBForCA(t)
+	defer cleanupDB()
+
 	passFile := filepath.Join(tmpDir, "test.pass")
 	if err := os.WriteFile(passFile, []byte("testpass123\n"), 0600); err != nil {
 		t.Fatal(err)
@@ -461,6 +513,7 @@ func TestCertificateVerification(t *testing.T) {
 		tmpDir,
 		365,
 		false,
+		db,
 	)
 	if err != nil {
 		t.Fatal(err)
