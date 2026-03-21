@@ -1,6 +1,7 @@
 package repository
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"net/http"
@@ -80,11 +81,75 @@ func (s *Server) handleGetIntermediateCA(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *Server) handleCRL(w http.ResponseWriter, r *http.Request) {
-	logger.Info("[HTTP] запрос CRL (заглушка), client=%s", r.RemoteAddr)
+	caParam := r.URL.Query().Get("ca")
 	
+	var crlPath string
+	if caParam == "" || caParam == "intermediate" {
+		crlPath = filepath.Join(s.crlDir, "intermediate.crl.pem")
+		if _, err := os.Stat(crlPath); os.IsNotExist(err) {
+			crlPath = filepath.Join(s.crlDir, "intermediate.crl.pem")
+		}
+	} else if caParam == "root" {
+		crlPath = filepath.Join(s.crlDir, "root.crl.pem")
+	} else {
+		http.Error(w, "неверный параметр ca. Используйте root или intermediate", http.StatusBadRequest)
+		return
+	}
+	
+	logger.Info("[HTTP] запрос CRL: ca=%s, path=%s, client=%s", caParam, crlPath, r.RemoteAddr)
+	
+	s.serveCRLFile(w, crlPath)
+}
+
+func (s *Server) handleCRLFile(w http.ResponseWriter, r *http.Request) {
+	filename := r.PathValue("filename")
+	if filename == "" {
+		http.Error(w, "имя файла не указано", http.StatusBadRequest)
+		return
+	}
+	
+	if !strings.HasSuffix(filename, ".crl") && !strings.HasSuffix(filename, ".crl.pem") {
+		filename = filename + ".crl.pem"
+	}
+	
+	crlPath := filepath.Join(s.crlDir, filename)
+	
+	if _, err := os.Stat(crlPath); os.IsNotExist(err) {
+		altPath := filepath.Join(s.crlDir, strings.TrimSuffix(filename, ".pem"))
+		if _, err := os.Stat(altPath); err == nil {
+			crlPath = altPath
+		}
+	}
+	
+	logger.Info("[HTTP] запрос CRL файла: %s, path=%s, client=%s", filename, crlPath, r.RemoteAddr)
+	
+	s.serveCRLFile(w, crlPath)
+}
+
+func (s *Server) serveCRLFile(w http.ResponseWriter, crlPath string) {
+	data, err := os.ReadFile(crlPath)
+	if err != nil {
+		logger.Warn("[HTTP] CRL файл не найден: %s", crlPath)
+		http.Error(w, "CRL не найден", http.StatusNotFound)
+		return
+	}
+	
+	fileInfo, err := os.Stat(crlPath)
+	if err == nil {
+		w.Header().Set("Last-Modified", fileInfo.ModTime().UTC().Format(http.TimeFormat))
+	}
+	
+	hash := sha256.Sum256(data)
+	etag := fmt.Sprintf(`"%x"`, hash[:8])
+	w.Header().Set("ETag", etag)
+	
+	w.Header().Set("Cache-Control", "max-age=3600")
 	w.Header().Set("Content-Type", "application/pkix-crl")
-	w.WriteHeader(http.StatusNotImplemented)
-	w.Write([]byte("CRL generation not yet implemented - Sprint 4"))
+	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=\"%s\"", filepath.Base(crlPath)))
+	w.WriteHeader(http.StatusOK)
+	w.Write(data)
+	
+	logger.Info("[HTTP] CRL отправлен: %s, size=%d", crlPath, len(data))
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -99,8 +164,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"status": "ok",
 		"timestamp": "%s",
 		"database": "%s",
-		"cert_dir": "%s"
-	}`, time.Now().UTC().Format(time.RFC3339), dbStatus, s.certDir)
+		"cert_dir": "%s",
+		"crl_dir": "%s"
+	}`, time.Now().UTC().Format(time.RFC3339), dbStatus, s.certDir, s.crlDir)
 	
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(response))

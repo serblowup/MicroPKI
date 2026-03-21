@@ -71,6 +71,19 @@ CREATE TABLE IF NOT EXISTS serial_counters (
 INSERT OR IGNORE INTO serial_counters (counter_name, counter_value, last_updated) 
 VALUES ('serial_counter', 0, datetime('now'));
 
+-- Таблица метаданных CRL
+CREATE TABLE IF NOT EXISTS crl_metadata (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ca_subject TEXT NOT NULL,
+    crl_number INTEGER NOT NULL,
+    last_generated TEXT NOT NULL,
+    next_update TEXT NOT NULL,
+    crl_path TEXT NOT NULL
+);
+
+-- Индекс для crl_metadata
+CREATE INDEX IF NOT EXISTS idx_crl_metadata_ca_subject ON crl_metadata(ca_subject);
+
 -- Триггер для автоматического обновления updated_at
 CREATE TRIGGER IF NOT EXISTS update_certificates_timestamp 
 AFTER UPDATE ON certificates
@@ -103,6 +116,17 @@ func GetMigrations() map[int]string {
 CREATE INDEX IF NOT EXISTS idx_certificates_revocation_date ON certificates(revocation_date) WHERE status = 'revoked';`,
 		3: `-- Миграция для добавления поля для хранения цепочки сертификатов
 ALTER TABLE certificates ADD COLUMN chain_pem TEXT;`,
+		4: `-- Миграция для создания таблицы метаданных CRL
+CREATE TABLE IF NOT EXISTS crl_metadata (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ca_subject TEXT NOT NULL,
+    crl_number INTEGER NOT NULL,
+    last_generated TEXT NOT NULL,
+    next_update TEXT NOT NULL,
+    crl_path TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_crl_metadata_ca_subject ON crl_metadata(ca_subject);`,
 	}
 }
 

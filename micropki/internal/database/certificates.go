@@ -299,7 +299,8 @@ func (d *Database) UpdateCertificateStatus(serialHex string, status string, reas
 	UPDATE certificates 
 	SET status = ?, 
 		revocation_reason = ?,
-		revocation_date = CASE WHEN ? = 'revoked' THEN datetime('now') ELSE NULL END
+		revocation_date = CASE WHEN ? = 'revoked' THEN datetime('now') ELSE NULL END,
+		updated_at = datetime('now')
 	WHERE serial_hex = ?
 	`
 
@@ -385,6 +386,66 @@ func (d *Database) GetRevokedCertificates() ([]*CertificateRecord, error) {
 	}
 
 	logger.Info("найдено %d отозванных сертификатов", len(records))
+	return records, nil
+}
+
+func (d *Database) GetRevokedCertificatesByIssuer(issuerSubject string) ([]*CertificateRecord, error) {
+	logger.Info("получение отозванных сертификатов для издателя: %s", issuerSubject)
+
+	query := `
+	SELECT id, serial_hex, subject, issuer, not_before, not_after, cert_pem,
+		   status, revocation_reason, revocation_date, created_at, common_name
+	FROM certificates
+	WHERE status = 'revoked' AND issuer = ?
+	ORDER BY revocation_date DESC
+	`
+
+	rows, err := d.DB.Query(query, issuerSubject)
+	if err != nil {
+		logger.Error("ошибка запроса отозванных сертификатов: %v", err)
+		return nil, fmt.Errorf("ошибка запроса отозванных сертификатов: %w", err)
+	}
+	defer rows.Close()
+
+	var records []*CertificateRecord
+	for rows.Next() {
+		var record CertificateRecord
+		var notBeforeStr, notAfterStr, createdAtStr string
+		var revocationDateStr sql.NullString
+
+		err := rows.Scan(
+			&record.ID,
+			&record.SerialHex,
+			&record.Subject,
+			&record.Issuer,
+			&notBeforeStr,
+			&notAfterStr,
+			&record.CertPEM,
+			&record.Status,
+			&record.RevocationReason,
+			&revocationDateStr,
+			&createdAtStr,
+			&record.CommonName,
+		)
+		if err != nil {
+			logger.Error("ошибка сканирования записи: %v", err)
+			continue
+		}
+
+		record.NotBefore, _ = time.Parse(time.RFC3339, notBeforeStr)
+		record.NotAfter, _ = time.Parse(time.RFC3339, notAfterStr)
+		record.CreatedAt, _ = time.Parse(time.RFC3339, createdAtStr)
+
+		if revocationDateStr.Valid {
+			var t time.Time
+			t, _ = time.Parse(time.RFC3339, revocationDateStr.String)
+			record.RevocationDate = sql.NullTime{Time: t, Valid: true}
+		}
+
+		records = append(records, &record)
+	}
+
+	logger.Info("найдено %d отозванных сертификатов для издателя %s", len(records), issuerSubject)
 	return records, nil
 }
 

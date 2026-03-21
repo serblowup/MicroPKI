@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -20,11 +21,13 @@ import (
 	"MicroPKI/internal/ca"
 	"MicroPKI/internal/certs"
 	"MicroPKI/internal/chain"
+	"MicroPKI/internal/crl"
 	"MicroPKI/internal/cryptoutil"
 	"MicroPKI/internal/csr"
 	"MicroPKI/internal/database"
 	"MicroPKI/internal/logger"
 	"MicroPKI/internal/repository"
+	"MicroPKI/internal/revocation"
 	"MicroPKI/internal/san"
 	"MicroPKI/internal/templates"
 )
@@ -88,6 +91,26 @@ var (
 		RunE:  runCAShowCert,
 	}
 
+	caRevokeCmd = &cobra.Command{
+		Use:   "revoke [serial]",
+		Short: "Отзыв сертификата",
+		Args:  cobra.ExactArgs(1),
+		RunE:  runCARevoke,
+	}
+
+	caGenCRLCmd = &cobra.Command{
+		Use:   "gen-crl",
+		Short: "Генерация списка отозванных сертификатов (CRL)",
+		RunE:  runCAGenCRL,
+	}
+
+	caCheckRevokedCmd = &cobra.Command{
+		Use:   "check-revoked [serial]",
+		Short: "Проверка статуса отзыва сертификата",
+		Args:  cobra.ExactArgs(1),
+		RunE:  runCACheckRevoked,
+	}
+
 	dbInitCmd = &cobra.Command{
 		Use:   "init",
 		Short: "Инициализация базы данных сертификатов",
@@ -137,6 +160,11 @@ var (
 	host            string
 	port            int
 	certDir         string
+
+	reason          string
+	crlFile         string
+	nextUpdateDays  int
+	caName          string
 )
 
 func init() {
@@ -150,6 +178,9 @@ func init() {
 	caCmd.AddCommand(caVerifyCmd)
 	caCmd.AddCommand(caListCertsCmd)
 	caCmd.AddCommand(caShowCertCmd)
+	caCmd.AddCommand(caRevokeCmd)
+	caCmd.AddCommand(caGenCRLCmd)
+	caCmd.AddCommand(caCheckRevokedCmd)
 	
 	dbCmd.AddCommand(dbInitCmd)
 	
@@ -220,6 +251,29 @@ func init() {
 	caVerifyCmd.MarkFlagRequired("root")
 	caVerifyCmd.MarkFlagRequired("intermediate")
 	caVerifyCmd.MarkFlagRequired("leaf")
+
+	caRevokeCmd.Flags().StringVar(&reason, "reason", "unspecified", "Причина отзыва: keyCompromise, cACompromise, affiliationChanged, superseded, cessationOfOperation, certificateHold, removeFromCRL, privilegeWithdrawn, aACompromise")
+	caRevokeCmd.Flags().StringVar(&crlFile, "crl", "", "Путь к CRL файлу для обновления")
+	caRevokeCmd.Flags().BoolVar(&force, "force", false, "Пропустить подтверждение")
+	caRevokeCmd.Flags().StringVar(&logFile, "log-file", "", "Файл для логов")
+	caRevokeCmd.Flags().StringVar(&logJSON, "log-json", "", "Файл для JSON логов аудита")
+	caRevokeCmd.Flags().StringVar(&dbPath, "db-path", "./pki/micropki.db", "Путь к SQLite базе данных")
+
+	caGenCRLCmd.Flags().StringVar(&caName, "ca", "", "УЦ: root или intermediate (или путь к сертификату)")
+	caGenCRLCmd.Flags().IntVar(&nextUpdateDays, "next-update", 7, "Дней до следующего обновления CRL")
+	caGenCRLCmd.Flags().StringVar(&outDir, "out-file", "", "Выходной файл CRL")
+	caGenCRLCmd.Flags().StringVar(&logFile, "log-file", "", "Файл для логов")
+	caGenCRLCmd.Flags().StringVar(&logJSON, "log-json", "", "Файл для JSON логов аудита")
+	caGenCRLCmd.Flags().StringVar(&dbPath, "db-path", "./pki/micropki.db", "Путь к SQLite базе данных")
+	caGenCRLCmd.Flags().StringVar(&caCert, "ca-cert", "", "Путь к сертификату УЦ (опционально, если ca не указан)")
+	caGenCRLCmd.Flags().StringVar(&caKey, "ca-key", "", "Путь к ключу УЦ (опционально)")
+	caGenCRLCmd.Flags().StringVar(&caPassFile, "ca-pass-file", "", "Файл с паролем УЦ")
+
+	caGenCRLCmd.MarkFlagRequired("ca")
+
+	caCheckRevokedCmd.Flags().StringVar(&dbPath, "db-path", "./pki/micropki.db", "Путь к SQLite базе данных")
+	caCheckRevokedCmd.Flags().StringVar(&logFile, "log-file", "", "Файл для логов")
+	caCheckRevokedCmd.Flags().StringVar(&logJSON, "log-json", "", "Файл для JSON логов аудита")
 
 	dbInitCmd.Flags().StringVar(&dbPath, "db-path", "./pki/micropki.db", "Путь к SQLite базе данных")
 	dbInitCmd.Flags().StringVar(&logFile, "log-file", "", "Файл для логов")
@@ -337,6 +391,256 @@ func runCAInit(cmd *cobra.Command, args []string) error {
 	fmt.Printf("   Ключ: %s\n", filepath.Join(outDir, "private", "ca.key.pem"))
 	fmt.Printf("   Политика: %s\n", filepath.Join(outDir, "policy.txt"))
 	
+	return nil
+}
+
+func runCARevoke(cmd *cobra.Command, args []string) error {
+	if err := logger.Init(logFile, logJSON); err != nil {
+		return fmt.Errorf("ошибка инициализации логгера: %w", err)
+	}
+	defer logger.Close()
+
+	serialHex := args[0]
+	logger.Info("отзыв сертификата: serial=%s, reason=%s", serialHex, reason)
+
+	reasonCode, err := revocation.ReasonCodeToInt(reason)
+	if err != nil {
+		logger.Error("неверный код причины: %v", err)
+		return err
+	}
+
+	db, err := openDatabase(dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	record, err := db.GetCertificateBySerial(serialHex)
+	if err != nil {
+		logger.Error("ошибка поиска сертификата: %v", err)
+		return fmt.Errorf("ошибка поиска сертификата: %w", err)
+	}
+	if record == nil {
+		logger.Error("сертификат с серийным номером %s не найден", serialHex)
+		return fmt.Errorf("сертификат с серийным номером %s не найден", serialHex)
+	}
+
+	if record.Status == "revoked" {
+		logger.Warn("сертификат %s уже отозван", serialHex)
+		fmt.Printf("Сертификат %s уже отозван\n", serialHex)
+		return nil
+	}
+
+	if !force {
+		fmt.Printf("Вы уверены, что хотите отозвать сертификат %s (subject=%s)? [y/N]: ", serialHex, record.Subject)
+		var response string
+		fmt.Scanln(&response)
+		if response != "y" && response != "Y" {
+			logger.Info("отзыв отменен пользователем")
+			fmt.Println("Отзыв отменен")
+			return nil
+		}
+	}
+
+	err = revocation.RevokeCertificate(db, serialHex, reasonCode, force)
+	if err != nil {
+		logger.Error("ошибка отзыва сертификата: %v", err)
+		return err
+	}
+
+	if crlFile != "" {
+		logger.Info("обновление CRL файла: %s", crlFile)
+	}
+
+	fmt.Printf("Сертификат %s успешно отозван\n", serialHex)
+	return nil
+}
+
+func runCAGenCRL(cmd *cobra.Command, args []string) error {
+	if err := logger.Init(logFile, logJSON); err != nil {
+		return fmt.Errorf("ошибка инициализации логгера: %w", err)
+	}
+	defer logger.Close()
+
+	logger.Info("генерация CRL для УЦ: %s", caName)
+
+	var certPath, keyPath, passPath string
+
+	if caCert != "" && caKey != "" && caPassFile != "" {
+		certPath = caCert
+		keyPath = caKey
+		passPath = caPassFile
+	} else {
+		switch caName {
+		case "root":
+			certPath = filepath.Join(filepath.Dir(dbPath), "certs", "ca.cert.pem")
+			keyPath = filepath.Join(filepath.Dir(dbPath), "private", "ca.key.pem")
+			passPath = filepath.Join(filepath.Dir(dbPath), "..", "root.pass")
+		case "intermediate":
+			certPath = filepath.Join(filepath.Dir(dbPath), "certs", "intermediate.cert.pem")
+			keyPath = filepath.Join(filepath.Dir(dbPath), "private", "intermediate.key.pem")
+			passPath = filepath.Join(filepath.Dir(dbPath), "..", "inter.pass")
+		default:
+			return fmt.Errorf("неизвестный УЦ: %s. Используйте root, intermediate или укажите --ca-cert, --ca-key, --ca-pass-file", caName)
+		}
+	}
+
+	certPEM, err := os.ReadFile(certPath)
+	if err != nil {
+		logger.Error("ошибка чтения сертификата УЦ: %v", err)
+		return fmt.Errorf("ошибка чтения сертификата УЦ: %w", err)
+	}
+
+	passphrase, err := os.ReadFile(passPath)
+	if err != nil {
+		logger.Error("ошибка чтения файла пароля: %v", err)
+		return fmt.Errorf("ошибка чтения файла пароля: %w", err)
+	}
+	defer func() {
+		for i := range passphrase {
+			passphrase[i] = 0
+		}
+	}()
+	if len(passphrase) > 0 && passphrase[len(passphrase)-1] == '\n' {
+		passphrase = passphrase[:len(passphrase)-1]
+	}
+
+	keyPEM, err := os.ReadFile(keyPath)
+	if err != nil {
+		logger.Error("ошибка чтения ключа УЦ: %v", err)
+		return fmt.Errorf("ошибка чтения ключа УЦ: %w", err)
+	}
+
+	caPrivateKey, err := cryptoutil.LoadEncryptedPrivateKeyFromPEM(keyPEM, passphrase)
+	if err != nil {
+		logger.Error("ошибка загрузки ключа УЦ: %v", err)
+		return fmt.Errorf("ошибка загрузки ключа УЦ: %w", err)
+	}
+
+	caSigner, ok := caPrivateKey.(crypto.Signer)
+	if !ok {
+		return fmt.Errorf("ключ УЦ не поддерживает подписание")
+	}
+
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		return fmt.Errorf("не удалось декодировать сертификат УЦ")
+	}
+	caCertificate, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return fmt.Errorf("ошибка парсинга сертификата УЦ: %w", err)
+	}
+
+	db, err := openDatabase(dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	revokedRecords, err := db.GetRevokedCertificatesByIssuer(caCertificate.Subject.String())
+	if err != nil {
+		logger.Error("ошибка получения отозванных сертификатов: %v", err)
+		return fmt.Errorf("ошибка получения отозванных сертификатов: %w", err)
+	}
+
+	revokedCerts := make([]crl.RevokedCertInfo, 0, len(revokedRecords))
+	for _, r := range revokedRecords {
+		serialBytes, _ := hex.DecodeString(r.SerialHex)
+		serial := new(big.Int).SetBytes(serialBytes)
+		reasonCode, _ := revocation.ReasonCodeToInt(r.RevocationReason.String)
+		revokedCerts = append(revokedCerts, crl.RevokedCertInfo{
+			SerialNumber:   serial,
+			RevocationTime: r.RevocationDate.Time,
+			ReasonCode:     reasonCode,
+		})
+	}
+
+	crlNumber, err := crl.GetNextCRLNumber(db, caCertificate.Subject.String())
+	if err != nil {
+		logger.Error("ошибка получения номера CRL: %v", err)
+		return fmt.Errorf("ошибка получения номера CRL: %w", err)
+	}
+
+	crlPEM, err := crl.GenerateCRL(caCertificate, caSigner, revokedCerts, crlNumber, nextUpdateDays)
+	if err != nil {
+		logger.Error("ошибка генерации CRL: %v", err)
+		return fmt.Errorf("ошибка генерации CRL: %w", err)
+	}
+
+	crlDir := filepath.Join(filepath.Dir(dbPath), "crl")
+	if err := os.MkdirAll(crlDir, 0755); err != nil {
+		return fmt.Errorf("ошибка создания директории crl: %w", err)
+	}
+
+	var crlPath string
+	if outDir != "" {
+		crlPath = outDir
+	} else {
+		crlPath = filepath.Join(crlDir, fmt.Sprintf("%s.crl.pem", caName))
+	}
+
+	if err := os.WriteFile(crlPath, crlPEM, 0644); err != nil {
+		logger.Error("ошибка сохранения CRL: %v", err)
+		return fmt.Errorf("ошибка сохранения CRL: %w", err)
+	}
+
+	nextUpdate := time.Now().UTC().AddDate(0, 0, nextUpdateDays)
+	if err := crl.UpdateCRLMetadata(db, caCertificate.Subject.String(), crlNumber, nextUpdate, crlPath); err != nil {
+		logger.Warn("ошибка обновления метаданных CRL: %v", err)
+	}
+
+	logger.Info("CRL успешно сгенерирован: %s, номер=%d, отозванных сертификатов=%d", crlPath, crlNumber, len(revokedCerts))
+	fmt.Printf("CRL успешно сгенерирован:\n")
+	fmt.Printf("   Файл: %s\n", crlPath)
+	fmt.Printf("   Номер: %d\n", crlNumber)
+	fmt.Printf("   Отозванных сертификатов: %d\n", len(revokedCerts))
+	fmt.Printf("   Следующее обновление: %s\n", nextUpdate.Format(time.RFC3339))
+
+	if logJSON != "" {
+		auditData := map[string]interface{}{
+			"action":           "crl_generated",
+			"ca":               caName,
+			"crl_number":       crlNumber,
+			"revoked_count":    len(revokedCerts),
+			"next_update_days": nextUpdateDays,
+			"crl_path":         crlPath,
+			"timestamp":        time.Now().UTC().Format(time.RFC3339),
+		}
+		logger.AuditJSON("crl_generated", auditData)
+	}
+
+	return nil
+}
+
+func runCACheckRevoked(cmd *cobra.Command, args []string) error {
+	if err := logger.Init(logFile, logJSON); err != nil {
+		return fmt.Errorf("ошибка инициализации логгера: %w", err)
+	}
+	defer logger.Close()
+
+	serialHex := args[0]
+	logger.Info("проверка статуса отзыва: serial=%s", serialHex)
+
+	db, err := openDatabase(dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	isRevoked, info, err := revocation.CheckRevoked(db, serialHex)
+	if err != nil {
+		logger.Error("ошибка проверки статуса: %v", err)
+		return err
+	}
+
+	if isRevoked {
+		fmt.Printf("Сертификат %s ОТОЗВАН\n", serialHex)
+		fmt.Printf("   Причина: %s (код %d)\n", info.ReasonString, info.ReasonCode)
+		fmt.Printf("   Дата отзыва: %s\n", info.RevocationTime.Format(time.RFC3339))
+	} else {
+		fmt.Printf("Сертификат %s ДЕЙСТВИТЕЛЕН (не отозван)\n", serialHex)
+	}
+
 	return nil
 }
 
@@ -1045,14 +1349,15 @@ func runRepoServe(cmd *cobra.Command, args []string) error {
 	}
 	defer db.Close()
 
-	server := repository.NewServer(host, port, db, certDir)
+	crlDir := filepath.Join(filepath.Dir(dbPath), "crl")
+	server := repository.NewServer(host, port, db, certDir, crlDir)
 	
 	fmt.Printf("HTTP сервер запущен на %s:%d\n", host, port)
 	fmt.Printf("  - GET  /certificate/{serial} - получить сертификат по серийному номеру\n")
 	fmt.Printf("  - GET  /ca/root               - получить корневой сертификат CA\n")
-	fmt.Printf("  - GET  /ca/intermediate        - получить промежуточный сертификат CA\n")
-	fmt.Printf("  - GET  /crl                    - получить CRL\n")
-	fmt.Printf("  - GET  /health                 - проверка работоспособности\n")
+	fmt.Printf("  - GET  /ca/intermediate       - получить промежуточный сертификат CA\n")
+	fmt.Printf("  - GET  /crl                   - получить CRL (параметр ?ca=root|intermediate)\n")
+	fmt.Printf("  - GET  /health                - проверка работоспособности\n")
 	fmt.Printf("\nДля остановки нажмите Ctrl+C\n")
 
 	if err := server.Start(); err != nil {

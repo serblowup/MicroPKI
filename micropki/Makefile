@@ -1,4 +1,4 @@
-.PHONY: build clean test test-short test-integration scripts verify help db-init serve
+.PHONY: build clean test test-short test-integration scripts verify help db-init serve revoke gen-crl check-revoked test-crl test-revocation
 
 BINARY_NAME=micropki
 BIN_DIR=bin
@@ -15,6 +15,11 @@ export CGO_CFLAGS
 VERSION=$(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 BUILD_TIME=$(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 LDFLAGS=-ldflags "-X main.version=$(VERSION) -X main.buildTime=$(BUILD_TIME)"
+
+SERIAL?=
+REASON?=unspecified
+CA?=intermediate
+NEXT_UPDATE?=7
 
 build:
 	@echo "Сборка $(BINARY_NAME)..."
@@ -51,6 +56,7 @@ test-integration:
 	@echo "Запуск интеграционных тестов..."
 	$(GOTEST) -v ./tests/ -run TestFullPKIChain
 	$(GOTEST) -v ./tests/ -run TestNegativeScenarios
+	$(GOTEST) -v ./tests/ -run TestRevocationLifecycle
 
 test-db:
 	@echo "Запуск тестов базы данных..."
@@ -59,6 +65,14 @@ test-db:
 test-repo:
 	@echo "Запуск тестов репозитория..."
 	$(GOTEST) -v ./tests/repository_test.go
+
+test-crl:
+	@echo "Запуск тестов CRL..."
+	$(GOTEST) -v ./tests/crl_test.go
+
+test-revocation:
+	@echo "Запуск тестов отзыва..."
+	$(GOTEST) -v ./tests/revocation_test.go
 
 db-init:
 	@echo "Инициализация базы данных..."
@@ -79,6 +93,45 @@ serve-public:
 status:
 	@echo "Проверка статуса сервера..."
 	./$(BIN_DIR)/$(BINARY_NAME) repo status
+
+revoke:
+	@echo "Отзыв сертификата..."
+	@if [ -z "$(SERIAL)" ]; then \
+		echo "Ошибка: необходимо указать SERIAL"; \
+		echo "Пример: make revoke SERIAL=0baee839362091a1 REASON=keyCompromise"; \
+		exit 1; \
+	fi
+	./$(BIN_DIR)/$(BINARY_NAME) ca revoke $(SERIAL) --reason $(REASON)
+
+revoke-force:
+	@echo "Принудительный отзыв сертификата..."
+	@if [ -z "$(SERIAL)" ]; then \
+		echo "Ошибка: необходимо указать SERIAL"; \
+		echo "Пример: make revoke-force SERIAL=0baee839362091a1 REASON=keyCompromise"; \
+		exit 1; \
+	fi
+	./$(BIN_DIR)/$(BINARY_NAME) ca revoke $(SERIAL) --reason $(REASON) --force
+
+gen-crl:
+	@echo "Генерация CRL..."
+	./$(BIN_DIR)/$(BINARY_NAME) ca gen-crl --ca $(CA) --next-update $(NEXT_UPDATE)
+
+gen-crl-root:
+	@echo "Генерация CRL корневого УЦ..."
+	./$(BIN_DIR)/$(BINARY_NAME) ca gen-crl --ca root --next-update $(NEXT_UPDATE)
+
+gen-crl-intermediate:
+	@echo "Генерация CRL промежуточного УЦ..."
+	./$(BIN_DIR)/$(BINARY_NAME) ca gen-crl --ca intermediate --next-update $(NEXT_UPDATE)
+
+check-revoked:
+	@echo "Проверка статуса отзыва..."
+	@if [ -z "$(SERIAL)" ]; then \
+		echo "Ошибка: необходимо указать SERIAL"; \
+		echo "Пример: make check-revoked SERIAL=0baee839362091a1"; \
+		exit 1; \
+	fi
+	./$(BIN_DIR)/$(BINARY_NAME) ca check-revoked $(SERIAL)
 
 scripts:
 	@echo "Запуск всех скриптов..."
@@ -134,23 +187,38 @@ examples:
 	@echo "       --subject \"/CN=example.com\" \\"
 	@echo "       --san dns:example.com"
 	@echo ""
-	@echo "5. Просмотр сертификатов:"
+	@echo "5. Отзыв сертификата:"
+	@echo "   make revoke SERIAL=\$$(./bin/micropki ca list-certs --format json | jq -r '.[0].serial_hex') REASON=keyCompromise"
+	@echo ""
+	@echo "6. Генерация CRL:"
+	@echo "   make gen-crl CA=intermediate NEXT_UPDATE=14"
+	@echo ""
+	@echo "7. Проверка статуса отзыва:"
+	@echo "   make check-revoked SERIAL=0baee839362091a1"
+	@echo ""
+	@echo "8. Просмотр сертификатов:"
 	@echo "   ./bin/micropki ca list-certs --format table"
 	@echo "   ./bin/micropki ca show-cert \$$(./bin/micropki ca list-certs --format json | jq -r '.[0].serial_hex')"
 	@echo ""
-	@echo "6. Запуск HTTP сервера:"
+	@echo "9. Запуск HTTP сервера:"
 	@echo "   make serve"
 	@echo ""
-	@echo "7. Проверка API:"
+	@echo "10. Проверка API:"
 	@echo "   curl http://127.0.0.1:8080/health"
 	@echo "   curl http://127.0.0.1:8080/ca/root"
-	@echo "   curl http://127.0.0.1:8080/certificate/\$$(./bin/micropki ca list-certs --format json | jq -r '.[0].serial_hex')"
+	@echo "   curl http://127.0.0.1:8080/ca/intermediate"
+	@echo "   curl http://127.0.0.1:8080/crl"
+	@echo "   curl http://127.0.0.1:8080/crl?ca=root"
+	@echo "   curl http://127.0.0.1:8080/crl/intermediate.crl.pem"
 	@echo ""
-	@echo "8. Сборка с предупреждениями:"
-	@echo "   make build-verbose    - сборка с отображением предупреждений"
+	@echo "11. Проверка CRL через OpenSSL:"
+	@echo "   openssl crl -inform PEM -in ./pki/crl/intermediate.crl.pem -text -noout"
+	@echo "   openssl crl -inform PEM -in ./pki/crl/intermediate.crl.pem -CAfile ./pki/certs/intermediate.cert.pem -noout"
 
 help:
 	@echo "Доступные команды:"
+	@echo ""
+	@echo "Сборка и тестирование:"
 	@echo "  make build          - сборка бинарного файла (предупреждения скрыты)"
 	@echo "  make build-verbose  - сборка с отображением предупреждений"
 	@echo "  make clean          - очистка временных файлов"
@@ -159,13 +227,29 @@ help:
 	@echo "  make test-integration - запуск интеграционных тестов"
 	@echo "  make test-db        - запуск тестов БД"
 	@echo "  make test-repo      - запуск тестов репозитория"
+	@echo "  make test-crl       - запуск тестов CRL"
+	@echo "  make test-revocation - запуск тестов отзыва"
+	@echo "  make verify         - проверка кода (fmt, vet, mod verify)"
+	@echo "  make deps           - установка зависимостей"
+	@echo ""
+	@echo "База данных:"
 	@echo "  make db-init        - инициализация БД"
 	@echo "  make db-init-force  - принудительная инициализация БД"
+	@echo ""
+	@echo "Управление УЦ и сертификатами:"
+	@echo "  make revoke SERIAL=<hex> REASON=<reason> - отзыв сертификата"
+	@echo "  make revoke-force SERIAL=<hex> REASON=<reason> - принудительный отзыв"
+	@echo "  make gen-crl CA=<ca> NEXT_UPDATE=<days> - генерация CRL"
+	@echo "  make gen-crl-root NEXT_UPDATE=<days> - генерация CRL корневого УЦ"
+	@echo "  make gen-crl-intermediate NEXT_UPDATE=<days> - генерация CRL промежуточного УЦ"
+	@echo "  make check-revoked SERIAL=<hex> - проверка статуса отзыва"
+	@echo ""
+	@echo "HTTP сервер:"
 	@echo "  make serve          - запуск HTTP сервера (127.0.0.1)"
 	@echo "  make serve-public   - запуск HTTP сервера (0.0.0.0)"
 	@echo "  make status         - проверка статуса сервера"
+	@echo ""
+	@echo "Прочее:"
 	@echo "  make scripts        - запуск всех исполняемых скриптов"
-	@echo "  make verify         - проверка кода (fmt, vet, mod verify)"
-	@echo "  make deps           - установка зависимостей"
 	@echo "  make examples       - показать примеры использования"
 	@echo "  make help           - показать эту справку"

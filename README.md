@@ -10,6 +10,8 @@
 - Поддержка Subject Alternative Name (SAN) - DNS, IP, email, URI
 - Подписание внешних CSR
 - Проверка цепочки сертификатов
+- Отзыв сертификатов с поддержкой всех причин RFC 5280
+- Генерация и распространение списков отзыва (CRL)
 - Безопасное хранение ключей с шифрованием (AES-256)
 - Генерация X.509 сертификатов с правильными расширениями
 - Документирование политики сертификации
@@ -17,13 +19,13 @@
 - Уникальные серийные номера (64-битные: timestamp + random)
 - Автоматическое сохранение сертификатов в БД при выпуске
 - Просмотр сертификатов в табличном, JSON и CSV форматах
-- HTTP репозиторий для получения сертификатов по API
+- HTTP репозиторий для получения сертификатов и CRL по API
 
 ## Требования
 
 - Go 1.21 или выше (разработка на go 1.25.7)
 - Make (для сборки)
-- OpenSSL (для проверки сертификатов)
+- OpenSSL (для проверки сертификатов и CRL)
 - SQLite 3.x (встроенная через go-sqlite3)
 
 ## Зависимости
@@ -207,6 +209,66 @@ make scripts
 | `--log-file` | Файл для логов | stderr |
 | `--force` | Принудительная перезапись | `false` |
 
+#### `ca revoke` - отзыв сертификата
+
+```bash
+# Отзыв сертификата по серийному номеру
+./bin/micropki ca revoke 0baee839362091a1 --reason keyCompromise
+
+# Отзыв с подтверждением (без --force)
+./bin/micropki ca revoke 0baee839362091a1 --reason superseded
+
+# Принудительный отзыв без подтверждения
+./bin/micropki ca revoke 0baee839362091a1 --reason keyCompromise --force
+```
+
+| Параметр | Описание | Значение по умолчанию |
+|----------|----------|----------------------|
+| `serial` | Серийный номер в hex формате (обязательно) | - |
+| `--reason` | Причина отзыва: unspecified, keyCompromise, cACompromise, affiliationChanged, superseded, cessationOfOperation, certificateHold, removeFromCRL, privilegeWithdrawn, aACompromise | `unspecified` |
+| `--crl` | Путь к CRL файлу для обновления | автоматически |
+| `--force` | Пропустить подтверждение | `false` |
+| `--db-path` | Путь к SQLite базе данных | `./pki/micropki.db` |
+
+#### `ca gen-crl` - генерация списка отозванных сертификатов (CRL)
+
+```bash
+# Генерация CRL для промежуточного УЦ
+./bin/micropki ca gen-crl --ca intermediate --next-update 14
+
+# Генерация CRL для корневого УЦ с пользовательским путем
+./bin/micropki ca gen-crl --ca root --next-update 7 --out-file ./backup/root.crl.pem
+
+# Генерация CRL с указанием сертификата и ключа
+./bin/micropki ca gen-crl --ca custom \
+    --ca-cert ./pki/certs/custom.cert.pem \
+    --ca-key ./pki/private/custom.key.pem \
+    --ca-pass-file ./custom.pass \
+    --next-update 30
+```
+
+| Параметр | Описание | Значение по умолчанию |
+|----------|----------|----------------------|
+| `--ca` | УЦ: root, intermediate или путь к сертификату | - |
+| `--next-update` | Дней до следующего обновления CRL | `7` |
+| `--out-file` | Выходной файл CRL | `<out-dir>/crl/<ca>.crl.pem` |
+| `--ca-cert` | Путь к сертификату УЦ (опционально) | - |
+| `--ca-key` | Путь к ключу УЦ (опционально) | - |
+| `--ca-pass-file` | Файл с паролем УЦ (опционально) | - |
+| `--db-path` | Путь к SQLite базе данных | `./pki/micropki.db` |
+
+#### `ca check-revoked` - проверка статуса отзыва
+
+```bash
+# Проверка статуса сертификата
+./bin/micropki ca check-revoked 0baee839362091a1
+```
+
+| Параметр | Описание | Значение по умолчанию |
+|----------|----------|----------------------|
+| `serial` | Серийный номер в hex формате (обязательно) | - |
+| `--db-path` | Путь к SQLite базе данных | `./pki/micropki.db` |
+
 #### `ca list-certs` - просмотр сертификатов в БД 
 
 ```bash
@@ -298,9 +360,10 @@ curl http://127.0.0.1:8080/health
 ```json
 {
   "status": "ok",
-  "timestamp": "2026-03-18T15:58:27Z",
+  "timestamp": "2026-03-21T15:58:27Z",
   "database": "ok",
-  "cert_dir": "./pki/certs"
+  "cert_dir": "./pki/certs",
+  "crl_dir": "./pki/crl"
 }
 ```
 
@@ -328,11 +391,29 @@ curl http://127.0.0.1:8080/certificate/0baee839362091a1 -o cert.pem
 openssl x509 -in cert.pem -text -noout | head -5
 ```
 
-#### `GET /crl` - получение CRL 
+#### `GET /crl` - получение списка отозванных сертификатов
 
 ```bash
-curl -v http://127.0.0.1:8080/crl
+# Получение CRL по умолчанию (промежуточный УЦ)
+curl -v http://127.0.0.1:8080/crl -o intermediate.crl.pem
+
+# Получение CRL корневого УЦ
+curl "http://127.0.0.1:8080/crl?ca=root" -o root.crl.pem
+
+# Получение CRL по имени файла
+curl http://127.0.0.1:8080/crl/intermediate.crl.pem -o crl.pem
+
+# Проверка CRL с помощью OpenSSL
+openssl crl -inform PEM -in intermediate.crl.pem -text -noout
+openssl crl -inform PEM -in intermediate.crl.pem -CAfile intermediate.cert.pem -noout
 ```
+
+**Заголовки ответа:**
+- `Content-Type: application/pkix-crl`
+- `Last-Modified`: время последнего изменения файла
+- `Cache-Control: max-age=3600`
+- `ETag`: хеш содержимого файла
+
 ---
 
 ## Поддерживаемые типы SAN
@@ -364,25 +445,43 @@ curl -v http://127.0.0.1:8080/crl
 │   └── example.com.key.pem      # незашифрованные ключи (0600)
 ├── csrs/
 │   └── intermediate.csr.pem     # CSR промежуточного УЦ
+├── crl/                         # CRL файлы
+│   ├── root.crl.pem             # CRL корневого УЦ
+│   └── intermediate.crl.pem     # CRL промежуточного УЦ
 └── policy.txt                   # документ политики сертификации
 ```
 
 ---
 
-## Примеры работы с БД
+## Примеры работы с отзывом сертификатов
 
 ```bash
-# Инициализация БД
-./bin/micropki db init --db-path ./pki/micropki.db
+# 1. Выпустить сертификат
+./bin/micropki ca issue-cert \
+    --ca-cert ./pki/certs/intermediate.cert.pem \
+    --ca-key ./pki/private/intermediate.key.pem \
+    --ca-pass-file ./inter.pass \
+    --template server \
+    --subject "/CN=test.example.com" \
+    --san dns:test.example.com
 
-# Создание корневого УЦ
-./bin/micropki ca init --subject "/CN=Test Root CA" --passphrase-file ./root.pass --db-path ./pki/micropki.db
+# 2. Посмотреть серийный номер
+./bin/micropki ca list-certs --format table
 
-# Просмотр всех сертификатов
-./bin/micropki ca list-certs --db-path ./pki/micropki.db --format table
+# 3. Отозвать сертификат
+./bin/micropki ca revoke 0baee839362091a1 --reason keyCompromise
 
-# Просмотр в JSON
-./bin/micropki ca list-certs --db-path ./pki/micropki.db --format json | jq '.[] | {serial: .serial_hex, subject: .subject}'
+# 4. Сгенерировать CRL
+./bin/micropki ca gen-crl --ca intermediate --next-update 14
+
+# 5. Проверить статус
+./bin/micropki ca check-revoked 0baee839362091a1
+
+# 6. Получить CRL через HTTP
+curl http://127.0.0.1:8080/crl -o crl.pem
+
+# 7. Проверить CRL через OpenSSL
+openssl crl -in crl.pem -text -noout | grep -A5 "Revoked Certificates"
 ```
 
 ---
@@ -426,6 +525,10 @@ openssl verify -CAfile pki/certs/ca.cert.pem \
     -untrusted pki/certs/intermediate.cert.pem \
     pki/certs/example.com.cert.pem
 
+# Проверка CRL
+openssl crl -inform PEM -in pki/crl/intermediate.crl.pem -text -noout
+openssl crl -inform PEM -in pki/crl/intermediate.crl.pem -CAfile pki/certs/intermediate.cert.pem -noout
+
 # Проверка соответствия ключа и сертификата
 openssl x509 -in pki/certs/example.com.cert.pem -noout -modulus
 openssl rsa -in pki/certs/example.com.key.pem -noout -modulus
@@ -433,15 +536,13 @@ openssl rsa -in pki/certs/example.com.key.pem -noout -modulus
 
 ## Логирование
 
-Все операции детально логируются. В Спринте 3 добавлено логирование HTTP запросов:
+Все операции детально логируются:
 
 ```
-2026-03-18T15:58:27.747Z [INFO] [HTTP] GET /health - 200 OK [28.252µs] client=127.0.0.1:45722
-2026-03-18T15:58:38.101Z [INFO] [HTTP] GET /ca/root - 200 OK [205.787µs] client=127.0.0.1:50916
-2026-03-18T15:59:05.934Z [WARN] неверный формат серийного номера: XYZ123
-2026-03-18T15:59:05.934Z [INFO] [HTTP] GET /certificate/XYZ123 - 400 Bad Request [71.26µs] client=127.0.0.1:60806
-2026-03-18T15:59:18.056Z [INFO] [HTTP] GET /crl - 501 Not Implemented [72.763µs] client=127.0.0.1:37614
-2026-03-18T15:59:50.991Z [INFO] [HTTP] GET /certificate/0000000000000000 - 404 Not Found [773.709µs] client=127.0.0.1:45602
+2026-03-21T15:44:54.074Z [INFO] корневой УЦ успешно создан в директории: test-debug
+2026-03-21T15:46:56.024Z [INFO] сертификат 0bb2dc0fae29114a успешно отозван, причина: keyCompromise
+2026-03-21T15:48:01.875Z [INFO] CRL успешно сгенерирован: test-debug/crl/intermediate.crl.pem, номер=1, отозванных сертификатов=2
+2026-03-21T15:50:07.227Z [INFO] [HTTP] GET /crl - 200 OK [146.089µs] client=127.0.0.1:35966
 ```
 
 ---
@@ -472,6 +573,12 @@ make test-db
 
 # Тесты репозитория
 make test-repo
+
+# Тесты CRL
+make test-crl
+
+# Тесты отзыва
+make test-revocation
 ```
 
 Тесты проверяют:
@@ -481,9 +588,11 @@ make test-repo
 - Валидацию SAN
 - Подписание внешних CSR
 - Проверку цепочек сертификатов
+- Отзыв сертификатов с различными причинами
+- Генерацию и проверку CRL
+- HTTP эндпоинты для CRL
 - Негативные сценарии
 - Работу с базой данных
-- HTTP эндпоинты
 
 ---
 
@@ -494,7 +603,7 @@ make test-repo
 3. **Парольная фраза**: никогда не попадает в логи (автоматически скрывается)
 4. **Временные данные**: очищаются из памяти после использования
 5. **База данных**: SQLite с правами 0644, чувствительные данные не хранятся
-6. **OpenSSL совместимость**: все сертификаты работают с OpenSSL
+6. **OpenSSL совместимость**: все сертификаты и CRL работают с OpenSSL
 
 ---
 
@@ -506,7 +615,8 @@ MicroPKI/
 │   └── sprints
 │       ├── 1 sprint.md
 │       ├── 2 sprint.md
-│       └── 3 sprint.md
+│       ├── 3 sprint.md
+│       └── 4 sprint.md
 ├── .gitignore
 ├── micropki
 │   ├── cmd
@@ -521,6 +631,9 @@ MicroPKI/
 │   │   │   └── certificate.go
 │   │   ├── chain
 │   │   │   └── chain.go
+│   │   ├── crl
+│   │   │   ├── crl.go
+│   │   │   └── manager.go
 │   │   ├── cryptoutil
 │   │   │   └── crypto.go
 │   │   ├── csr
@@ -536,22 +649,27 @@ MicroPKI/
 │   │   │   ├── handlers.go
 │   │   │   ├── middleware.go
 │   │   │   └── server.go
+│   │   ├── revocation
+│   │   │   └── revocation.go
 │   │   ├── san
 │   │   │   └── san.go
 │   │   └── templates
 │   │       └── templates.go
 │   ├── Makefile
 │   ├── scripts
+│   │   ├── test-revocation-with-openssl.sh
 │   │   ├── test.sh
 │   │   └── verify-chain.sh
 │   └── tests
 │       ├── ca_test.go
 │       ├── chain_test.go
+│       ├── crl_test.go
 │       ├── crypto_test.go
 │       ├── csr_test.go
 │       ├── database_test.go
 │       ├── integration_test.go
 │       ├── repository_test.go
+│       ├── revocation_test.go
 │       ├── san_test.go
 │       └── templates_test.go
 └── README.md

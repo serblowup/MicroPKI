@@ -19,16 +19,18 @@ type Server struct {
 	port       int
 	db         *database.Database
 	certDir    string
+	crlDir     string
 	httpServer *http.Server
 	router     *http.ServeMux
 }
 
-func NewServer(host string, port int, db *database.Database, certDir string) *Server {
+func NewServer(host string, port int, db *database.Database, certDir string, crlDir string) *Server {
 	s := &Server{
 		host:    host,
 		port:    port,
 		db:      db,
 		certDir: certDir,
+		crlDir:  crlDir,
 		router:  http.NewServeMux(),
 	}
 
@@ -43,6 +45,7 @@ func (s *Server) registerRoutes() {
 	s.router.HandleFunc("GET /ca/intermediate", s.withLogging(s.handleGetIntermediateCA))
 	
 	s.router.HandleFunc("GET /crl", s.withLogging(s.handleCRL))
+	s.router.HandleFunc("GET /crl/{filename}", s.withLogging(s.handleCRLFile))
 	
 	s.router.HandleFunc("GET /health", s.withLogging(s.handleHealth))
 }
@@ -60,6 +63,7 @@ func (s *Server) Start() error {
 
 	logger.Info("запуск HTTP сервера на %s", addr)
 	logger.Info("директория с сертификатами: %s", s.certDir)
+	logger.Info("директория с CRL: %s", s.crlDir)
 	
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
@@ -104,14 +108,16 @@ func IsRunning(host string, port int) bool {
 	return true
 }
 
-// Функции для тестов
-
 func (s *Server) Router() *http.ServeMux {
 	return s.router
 }
 
 func (s *Server) CertDir() string {
 	return s.certDir
+}
+
+func (s *Server) CrlDir() string {
+	return s.crlDir
 }
 
 func (s *Server) WithCORS(handler http.Handler) http.Handler {
