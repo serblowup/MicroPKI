@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -12,9 +13,12 @@ import (
 	"encoding/pem"
 	"fmt"
 	"math/big"
+	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -26,6 +30,7 @@ import (
 	"MicroPKI/internal/csr"
 	"MicroPKI/internal/database"
 	"MicroPKI/internal/logger"
+	"MicroPKI/internal/ocsp"
 	"MicroPKI/internal/repository"
 	"MicroPKI/internal/revocation"
 	"MicroPKI/internal/san"
@@ -165,6 +170,38 @@ var (
 	crlFile         string
 	nextUpdateDays  int
 	caName          string
+
+	ocspCmd = &cobra.Command{
+		Use:   "ocsp",
+		Short: "Управление OCSP-ответчиком",
+	}
+
+	caIssueOCSPCertCmd = &cobra.Command{
+		Use:   "issue-ocsp-cert",
+		Short: "Выпуск сертификата OCSP-ответчика",
+		RunE:  runCAIssueOCSPCert,
+	}
+
+	ocspServeCmd = &cobra.Command{
+		Use:   "serve",
+		Short: "Запуск OCSP-ответчика",
+		RunE:  runOCSPServe,
+	}
+
+	ocspSubject      string
+	ocspKeyType      string
+	ocspKeySize      int
+	ocspPassFile     string
+	ocspOutDir       string
+	ocspValidityDays int
+	ocspSANS         []string
+
+	ocspHost          string
+	ocspPort          int
+	ocspResponderCert string
+	ocspResponderKey  string
+	ocspCACert        string
+	ocspCacheTTL      int
 )
 
 func init() {
@@ -301,6 +338,43 @@ func init() {
 	repoStatusCmd.Flags().IntVar(&port, "port", 8080, "TCP порт")
 	repoStatusCmd.Flags().StringVar(&logFile, "log-file", "", "Файл для логов")
 	repoStatusCmd.Flags().StringVar(&logJSON, "log-json", "", "Файл для JSON логов аудита")
+
+	rootCmd.AddCommand(ocspCmd)
+	ocspCmd.AddCommand(ocspServeCmd)
+	
+	caCmd.AddCommand(caIssueOCSPCertCmd)
+
+	caIssueOCSPCertCmd.Flags().StringVar(&caCert, "ca-cert", "", "Сертификат CA для подписи (обязательно)")
+	caIssueOCSPCertCmd.Flags().StringVar(&caKey, "ca-key", "", "Ключ CA (обязательно)")
+	caIssueOCSPCertCmd.Flags().StringVar(&caPassFile, "ca-pass-file", "", "Файл с паролем CA ключа (обязательно)")
+	caIssueOCSPCertCmd.Flags().StringVar(&subject, "subject", "", "Subject для OCSP-сертификата (обязательно)")
+	caIssueOCSPCertCmd.Flags().StringVar(&keyType, "key-type", "rsa", "Тип ключа: rsa или ecc")
+	caIssueOCSPCertCmd.Flags().IntVar(&keySize, "key-size", 2048, "Размер ключа (RSA: 2048+, ECC: 256+)")
+	caIssueOCSPCertCmd.Flags().StringSliceVar(&sanStrings, "san", []string{}, "SAN (DNS имена)")
+	caIssueOCSPCertCmd.Flags().StringVar(&outDir, "out-dir", "./pki/ocsp", "Выходная директория")
+	caIssueOCSPCertCmd.Flags().IntVar(&validityDays, "validity-days", 365, "Срок действия в днях")
+	caIssueOCSPCertCmd.Flags().StringVar(&logFile, "log-file", "", "Файл для логов")
+	caIssueOCSPCertCmd.Flags().StringVar(&logJSON, "log-json", "", "Файл для JSON логов аудита")
+	caIssueOCSPCertCmd.Flags().StringVar(&dbPath, "db-path", "./pki/micropki.db", "Путь к SQLite базе данных")
+
+	caIssueOCSPCertCmd.MarkFlagRequired("ca-cert")
+	caIssueOCSPCertCmd.MarkFlagRequired("ca-key")
+	caIssueOCSPCertCmd.MarkFlagRequired("ca-pass-file")
+	caIssueOCSPCertCmd.MarkFlagRequired("subject")
+
+	ocspServeCmd.Flags().StringVar(&ocspHost, "host", "127.0.0.1", "Адрес для привязки")
+	ocspServeCmd.Flags().IntVar(&ocspPort, "port", 8081, "TCP порт")
+	ocspServeCmd.Flags().StringVar(&dbPath, "db-path", "./pki/micropki.db", "Путь к SQLite базе данных")
+	ocspServeCmd.Flags().StringVar(&ocspResponderCert, "responder-cert", "", "Сертификат OCSP-ответчика (PEM)")
+	ocspServeCmd.Flags().StringVar(&ocspResponderKey, "responder-key", "", "Ключ OCSP-ответчика (PEM, незашифрованный)")
+	ocspServeCmd.Flags().StringVar(&ocspCACert, "ca-cert", "", "Сертификат CA эмитента")
+	ocspServeCmd.Flags().IntVar(&ocspCacheTTL, "cache-ttl", 60, "TTL кэша в секундах")
+	ocspServeCmd.Flags().StringVar(&logFile, "log-file", "", "Файл для логов")
+	ocspServeCmd.Flags().StringVar(&logJSON, "log-json", "", "Файл для JSON логов аудита")
+
+	ocspServeCmd.MarkFlagRequired("responder-cert")
+	ocspServeCmd.MarkFlagRequired("responder-key")
+	ocspServeCmd.MarkFlagRequired("ca-cert")
 }
 
 func openDatabase(dbPath string) (*database.Database, error) {
@@ -1577,6 +1651,242 @@ func updatePolicyWithIntermediate(outDir, subject string, serialNumber *big.Int,
 		return err
 	}
 
+	return nil
+}
+
+func runCAIssueOCSPCert(cmd *cobra.Command, args []string) error {
+	if err := logger.Init(logFile, logJSON); err != nil {
+		return fmt.Errorf("ошибка инициализации логгера: %w", err)
+	}
+	defer logger.Close()
+
+	logger.Info("начало выпуска сертификата OCSP-ответчика")
+
+	if keyType != "rsa" && keyType != "ecc" {
+		return fmt.Errorf("key-type должен быть rsa или ecc")
+	}
+	if keyType == "rsa" && keySize < 2048 {
+		return fmt.Errorf("для RSA размер ключа должен быть не менее 2048 бит")
+	}
+	if keyType == "ecc" && keySize < 256 {
+		return fmt.Errorf("для ECC размер ключа должен быть не менее 256 бит")
+	}
+
+	caPass, err := os.ReadFile(caPassFile)
+	if err != nil {
+		return fmt.Errorf("ошибка чтения файла пароля CA: %w", err)
+	}
+	defer func() {
+		for i := range caPass {
+			caPass[i] = 0
+		}
+	}()
+	if len(caPass) > 0 && caPass[len(caPass)-1] == '\n' {
+		caPass = caPass[:len(caPass)-1]
+	}
+
+	caCertPEM, err := os.ReadFile(caCert)
+	if err != nil {
+		return fmt.Errorf("ошибка чтения сертификата CA: %w", err)
+	}
+
+	caKeyPEM, err := os.ReadFile(caKey)
+	if err != nil {
+		return fmt.Errorf("ошибка чтения ключа CA: %w", err)
+	}
+
+	caPrivateKey, err := cryptoutil.LoadEncryptedPrivateKeyFromPEM(caKeyPEM, caPass)
+	if err != nil {
+		return fmt.Errorf("ошибка загрузки ключа CA: %w", err)
+	}
+
+	caSigner, ok := caPrivateKey.(crypto.Signer)
+	if !ok {
+		return fmt.Errorf("ключ CA не поддерживает подписание")
+	}
+
+	block, _ := pem.Decode(caCertPEM)
+	if block == nil {
+		return fmt.Errorf("не удалось декодировать сертификат CA")
+	}
+	caCertificate, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return fmt.Errorf("ошибка парсинга сертификата CA: %w", err)
+	}
+
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		return fmt.Errorf("ошибка создания выходной директории: %w", err)
+	}
+
+	logger.Info("генерация ключа OCSP-ответчика (незашифрованного)")
+	var ocspPrivateKey crypto.PrivateKey
+	var pubKey crypto.PublicKey
+
+	switch keyType {
+	case "rsa":
+		key, err := rsa.GenerateKey(rand.Reader, keySize)
+		if err != nil {
+			return fmt.Errorf("ошибка генерации RSA ключа: %w", err)
+		}
+		ocspPrivateKey = key
+		pubKey = &key.PublicKey
+	case "ecc":
+		var curve elliptic.Curve
+		switch keySize {
+		case 256:
+			curve = elliptic.P256()
+		case 384:
+			curve = elliptic.P384()
+		default:
+			return fmt.Errorf("неподдерживаемый размер ECC ключа: %d", keySize)
+		}
+		key, err := ecdsa.GenerateKey(curve, rand.Reader)
+		if err != nil {
+			return fmt.Errorf("ошибка генерации ECC ключа: %w", err)
+		}
+		ocspPrivateKey = key
+		pubKey = &key.PublicKey
+	}
+
+	keyPath := filepath.Join(outDir, "ocsp.key.pem")
+	var keyPEM []byte
+	switch k := ocspPrivateKey.(type) {
+	case *rsa.PrivateKey:
+		keyPEM = pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(k)})
+	case *ecdsa.PrivateKey:
+		keyBytes, _ := x509.MarshalECPrivateKey(k)
+		keyPEM = pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes})
+	}
+	if err := os.WriteFile(keyPath, keyPEM, 0600); err != nil {
+		return fmt.Errorf("ошибка сохранения ключа: %w", err)
+	}
+	logger.Warn("внимание: закрытый ключ OCSP-ответчика сохранен незашифрованным: %s", keyPath)
+	fmt.Printf("ВНИМАНИЕ: Закрытый ключ OCSP-ответчика сохранен незашифрованным: %s\n", keyPath)
+
+	template, err := certs.GenerateOCSPResponderTemplate(subject, pubKey, validityDays, sanStrings)
+	if err != nil {
+		return fmt.Errorf("ошибка создания шаблона: %w", err)
+	}
+
+	template.Issuer = caCertificate.Subject
+	template.AuthorityKeyId = caCertificate.SubjectKeyId
+
+	certDER, err := x509.CreateCertificate(rand.Reader, template, caCertificate, pubKey, caSigner)
+	if err != nil {
+		return fmt.Errorf("ошибка подписания сертификата: %w", err)
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	certPath := filepath.Join(outDir, "ocsp.cert.pem")
+	if err := os.WriteFile(certPath, certPEM, 0644); err != nil {
+		return fmt.Errorf("ошибка сохранения сертификата: %w", err)
+	}
+
+	if dbPath != "" {
+		db, err := openDatabase(dbPath)
+		if err == nil {
+			defer db.Close()
+			cert, _ := x509.ParseCertificate(certDER)
+			if err := db.InsertCertificate(cert, certPEM, "valid"); err != nil {
+				logger.Warn("не удалось сохранить сертификат в БД: %v", err)
+			}
+		}
+	}
+
+	if logJSON != "" {
+		auditData := map[string]interface{}{
+			"action":        "ocsp_cert_issued",
+			"subject":       subject,
+			"key_type":      keyType,
+			"key_size":      keySize,
+			"sans":          sanStrings,
+			"validity_days": validityDays,
+			"cert_path":     certPath,
+			"key_path":      keyPath,
+			"timestamp":     time.Now().UTC().Format(time.RFC3339),
+		}
+		logger.AuditJSON("ocsp_certificate_issued", auditData)
+	}
+
+	logger.Info("сертификат OCSP-ответчика успешно создан")
+	fmt.Printf("\nСертификат OCSP-ответчика успешно создан!\n")
+	fmt.Printf("   Сертификат: %s\n", certPath)
+	fmt.Printf("   Ключ: %s\n", keyPath)
+	fmt.Printf("   Subject: %s\n", subject)
+
+	return nil
+}
+
+func runOCSPServe(cmd *cobra.Command, args []string) error {
+	if err := logger.Init(logFile, logJSON); err != nil {
+		return fmt.Errorf("ошибка инициализации логгера: %w", err)
+	}
+	defer logger.Close()
+
+	logger.Info("запуск OCSP-ответчика на %s:%d", ocspHost, ocspPort)
+	logger.Info("БД: %s", dbPath)
+	logger.Info("сертификат ответчика: %s", ocspResponderCert)
+	logger.Info("CA сертификат: %s", ocspCACert)
+	logger.Info("TTL кэша: %d секунд", ocspCacheTTL)
+
+	db, err := openDatabase(dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	responder, err := ocsp.NewOCSPResponder(
+		db,
+		ocspResponderCert,
+		ocspResponderKey,
+		ocspCACert,
+		ocspCacheTTL,
+		ocspHost,
+		ocspPort,
+	)
+	if err != nil {
+		return fmt.Errorf("ошибка создания OCSP-ответчика: %w", err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", responder.HandleOCSPRequest)
+	mux.HandleFunc("/ocsp", responder.HandleOCSPRequest)
+
+	server := &http.Server{
+		Addr:         fmt.Sprintf("%s:%d", ocspHost, ocspPort),
+		Handler:      mux,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		logger.Info("OCSP-ответчик запущен на http://%s:%d", ocspHost, ocspPort)
+		fmt.Printf("\nOCSP-ответчик запущен на %s:%d\n", ocspHost, ocspPort)
+		fmt.Printf("  POST / - OCSP запросы\n")
+		fmt.Printf("  POST /ocsp - альтернативный путь\n")
+		fmt.Printf("\nДля остановки нажмите Ctrl+C\n")
+
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("ошибка HTTP сервера: %v", err)
+		}
+	}()
+
+	<-stop
+	logger.Info("получен сигнал завершения, останавливаем OCSP-ответчика...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		logger.Error("ошибка при остановке сервера: %v", err)
+		return err
+	}
+
+	logger.Info("OCSP-ответчик остановлен")
 	return nil
 }
 

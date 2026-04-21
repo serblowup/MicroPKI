@@ -1,10 +1,11 @@
 module MicroPKI
 
-go 1.25
+go 1.25.0
 
 require (
 	github.com/mattn/go-sqlite3 v1.14.22
 	github.com/spf13/cobra v1.8.0
+	golang.org/x/crypto v0.49.0
 )
 
 require (

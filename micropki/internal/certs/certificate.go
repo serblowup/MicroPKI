@@ -45,7 +45,6 @@ func ValidateSerialNumber(serial *big.Int, db *database.Database) (bool, error) 
 	return sg.ValidateSerialNumber(serial)
 }
 
-
 func CalculateSKI(pubKey crypto.PublicKey) ([]byte, error) {
 	pubBytes, err := x509.MarshalPKIXPublicKey(pubKey)
 	if err != nil {
@@ -173,4 +172,42 @@ func CreateCertificatePEM(template *x509.Certificate, pubKey crypto.PublicKey, s
 
 func GetAKIFromCert(cert *x509.Certificate) []byte {
 	return cert.SubjectKeyId
+}
+
+func GenerateOCSPResponderTemplate(subjectDN string, pubKey crypto.PublicKey, validityDays int, sans []string) (*x509.Certificate, error) {
+	name, err := ParseDN(subjectDN)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка парсинга subject: %w", err)
+	}
+
+	serialNumber, err := GenerateSerialNumber()
+	if err != nil {
+		return nil, fmt.Errorf("ошибка генерации серийного номера: %w", err)
+	}
+
+	ski, err := CalculateSKI(pubKey)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка вычисления subject key identifier: %w", err)
+	}
+
+	notBefore := time.Now().UTC()
+	notAfter := notBefore.AddDate(0, 0, validityDays)
+
+	template := &x509.Certificate{
+		SerialNumber:          serialNumber,
+		Subject:               *name,
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageOCSPSigning},
+		BasicConstraintsValid: true,
+		IsCA:                  false,
+		SubjectKeyId:          ski,
+	}
+
+	for _, san := range sans {
+		template.DNSNames = append(template.DNSNames, san)
+	}
+
+	return template, nil
 }

@@ -1,9 +1,9 @@
 package database
 
 import (
-	"crypto/x509"
 	"crypto/ecdsa"
 	"crypto/rsa"
+	"crypto/x509"
 	"database/sql"
 	"encoding/hex"
 	"encoding/pem"
@@ -29,6 +29,20 @@ type CertificateRecord struct {
 	CommonName       string
 	KeyType          string
 	KeySize          int
+}
+
+func parseRevocationDate(dateStr string) (time.Time, error) {
+	formats := []string{
+		"2006-01-02 15:04:05",
+		time.RFC3339,
+		"2006-01-02T15:04:05",
+	}
+	for _, format := range formats {
+		if t, err := time.Parse(format, dateStr); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("не удалось распарсить дату: %s", dateStr)
 }
 
 func (d *Database) InsertCertificate(cert *x509.Certificate, certPEM []byte, status string) error {
@@ -62,7 +76,7 @@ func (d *Database) InsertCertificate(cert *x509.Certificate, certPEM []byte, sta
 	`
 
 	_, err = tx.Exec(query,
-		hex.EncodeToString(cert.SerialNumber.Bytes()),
+		strings.ToLower(hex.EncodeToString(cert.SerialNumber.Bytes())),
 		cert.Subject.String(),
 		cert.Issuer.String(),
 		cert.NotBefore.UTC().Format(time.RFC3339),
@@ -90,7 +104,7 @@ func (d *Database) InsertCertificate(cert *x509.Certificate, certPEM []byte, sta
 
 	auditData := map[string]interface{}{
 		"action":        "certificate_inserted",
-		"serial_number": hex.EncodeToString(cert.SerialNumber.Bytes()),
+		"serial_number": strings.ToLower(hex.EncodeToString(cert.SerialNumber.Bytes())),
 		"subject":       cert.Subject.String(),
 		"common_name":   commonName,
 		"issuer":        cert.Issuer.String(),
@@ -107,62 +121,64 @@ func (d *Database) InsertCertificate(cert *x509.Certificate, certPEM []byte, sta
 }
 
 func (d *Database) InsertCertificateTx(tx *sql.Tx, cert *x509.Certificate, certPEM []byte, status string) error {
-    if tx == nil {
-        return fmt.Errorf("tx не может быть nil")
-    }
-    
-    logger.Info("вставка сертификата в БД (транзакция): serial=%x, subject=%s", cert.SerialNumber, cert.Subject.CommonName)
+	if tx == nil {
+		return fmt.Errorf("tx не может быть nil")
+	}
 
-    commonName := cert.Subject.CommonName
-    if commonName == "" && len(cert.Subject.Names) > 0 {
-        for _, name := range cert.Subject.Names {
-            if name.Type.String() == "2.5.4.3" {
-                if cn, ok := name.Value.(string); ok {
-                    commonName = cn
-                    break
-                }
-            }
-        }
-    }
+	logger.Info("вставка сертификата в БД (транзакция): serial=%x, subject=%s", cert.SerialNumber, cert.Subject.CommonName)
 
-    keyType, keySize := getKeyInfo(cert.PublicKey)
+	commonName := cert.Subject.CommonName
+	if commonName == "" && len(cert.Subject.Names) > 0 {
+		for _, name := range cert.Subject.Names {
+			if name.Type.String() == "2.5.4.3" {
+				if cn, ok := name.Value.(string); ok {
+					commonName = cn
+					break
+				}
+			}
+		}
+	}
 
-    query := `
+	keyType, keySize := getKeyInfo(cert.PublicKey)
+
+	query := `
     INSERT INTO certificates (
         serial_hex, subject, issuer, not_before, not_after, cert_pem, 
         status, created_at, common_name, key_type, key_size
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `
 
-    _, err := tx.Exec(query,
-        hex.EncodeToString(cert.SerialNumber.Bytes()),
-        cert.Subject.String(),
-        cert.Issuer.String(),
-        cert.NotBefore.UTC().Format(time.RFC3339),
-        cert.NotAfter.UTC().Format(time.RFC3339),
-        string(certPEM),
-        status,
-        time.Now().UTC().Format(time.RFC3339),
-        commonName,
-        keyType,
-        keySize,
-    )
+	_, err := tx.Exec(query,
+		strings.ToLower(hex.EncodeToString(cert.SerialNumber.Bytes())),
+		cert.Subject.String(),
+		cert.Issuer.String(),
+		cert.NotBefore.UTC().Format(time.RFC3339),
+		cert.NotAfter.UTC().Format(time.RFC3339),
+		string(certPEM),
+		status,
+		time.Now().UTC().Format(time.RFC3339),
+		commonName,
+		keyType,
+		keySize,
+	)
 
-    if err != nil {
-        if strings.Contains(err.Error(), "UNIQUE constraint failed") {
-            logger.Error("попытка вставить дубликат серийного номера: %x", cert.SerialNumber)
-            return fmt.Errorf("сертификат с серийным номером %x уже существует", cert.SerialNumber)
-        }
-        logger.Error("ошибка вставки сертификата: %v", err)
-        return fmt.Errorf("ошибка вставки сертификата: %w", err)
-    }
+	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			logger.Error("попытка вставить дубликат серийного номера: %x", cert.SerialNumber)
+			return fmt.Errorf("сертификат с серийным номером %x уже существует", cert.SerialNumber)
+		}
+		logger.Error("ошибка вставки сертификата: %v", err)
+		return fmt.Errorf("ошибка вставки сертификата: %w", err)
+	}
 
-    logger.Info("сертификат успешно вставлен (транзакция): serial=%x", cert.SerialNumber)
-    return nil
+	logger.Info("сертификат успешно вставлен (транзакция): serial=%x", cert.SerialNumber)
+	return nil
 }
 
 func (d *Database) GetCertificateBySerial(serialHex string) (*CertificateRecord, error) {
 	logger.Info("поиск сертификата по серийному номеру: %s", serialHex)
+
+	serialHex = strings.ToLower(serialHex)
 
 	query := `
 	SELECT id, serial_hex, subject, issuer, not_before, not_after, cert_pem,
@@ -206,9 +222,11 @@ func (d *Database) GetCertificateBySerial(serialHex string) (*CertificateRecord,
 	record.CreatedAt, _ = time.Parse(time.RFC3339, createdAtStr)
 
 	if revocationDateStr.Valid {
-		var t time.Time
-		t, _ = time.Parse(time.RFC3339, revocationDateStr.String)
-		record.RevocationDate = sql.NullTime{Time: t, Valid: true}
+		if t, err := parseRevocationDate(revocationDateStr.String); err == nil {
+			record.RevocationDate = sql.NullTime{Time: t, Valid: true}
+		} else {
+			logger.Warn("не удалось распарсить дату отзыва: %s", revocationDateStr.String)
+		}
 	}
 
 	logger.Info("сертификат найден: subject=%s", record.Subject)
@@ -280,9 +298,9 @@ func (d *Database) ListCertificates(status string, issuer string, daysUntilExpir
 		record.CreatedAt, _ = time.Parse(time.RFC3339, createdAtStr)
 
 		if revocationDateStr.Valid {
-			var t time.Time
-			t, _ = time.Parse(time.RFC3339, revocationDateStr.String)
-			record.RevocationDate = sql.NullTime{Time: t, Valid: true}
+			if t, err := parseRevocationDate(revocationDateStr.String); err == nil {
+				record.RevocationDate = sql.NullTime{Time: t, Valid: true}
+			}
 		}
 
 		records = append(records, &record)
@@ -294,6 +312,8 @@ func (d *Database) ListCertificates(status string, issuer string, daysUntilExpir
 
 func (d *Database) UpdateCertificateStatus(serialHex string, status string, reason string) error {
 	logger.Info("обновление статуса сертификата: serial=%s, status=%s", serialHex, status)
+
+	serialHex = strings.ToLower(serialHex)
 
 	query := `
 	UPDATE certificates 
@@ -317,11 +337,11 @@ func (d *Database) UpdateCertificateStatus(serialHex string, status string, reas
 	}
 
 	auditData := map[string]interface{}{
-		"action":         "certificate_status_updated",
-		"serial_number":  serialHex,
-		"new_status":     status,
-		"reason":         reason,
-		"timestamp":      time.Now().UTC().Format(time.RFC3339),
+		"action":        "certificate_status_updated",
+		"serial_number": serialHex,
+		"new_status":    status,
+		"reason":        reason,
+		"timestamp":     time.Now().UTC().Format(time.RFC3339),
 	}
 	logger.AuditJSON("status_updated", auditData)
 
@@ -377,9 +397,9 @@ func (d *Database) GetRevokedCertificates() ([]*CertificateRecord, error) {
 		record.CreatedAt, _ = time.Parse(time.RFC3339, createdAtStr)
 
 		if revocationDateStr.Valid {
-			var t time.Time
-			t, _ = time.Parse(time.RFC3339, revocationDateStr.String)
-			record.RevocationDate = sql.NullTime{Time: t, Valid: true}
+			if t, err := parseRevocationDate(revocationDateStr.String); err == nil {
+				record.RevocationDate = sql.NullTime{Time: t, Valid: true}
+			}
 		}
 
 		records = append(records, &record)
@@ -437,9 +457,9 @@ func (d *Database) GetRevokedCertificatesByIssuer(issuerSubject string) ([]*Cert
 		record.CreatedAt, _ = time.Parse(time.RFC3339, createdAtStr)
 
 		if revocationDateStr.Valid {
-			var t time.Time
-			t, _ = time.Parse(time.RFC3339, revocationDateStr.String)
-			record.RevocationDate = sql.NullTime{Time: t, Valid: true}
+			if t, err := parseRevocationDate(revocationDateStr.String); err == nil {
+				record.RevocationDate = sql.NullTime{Time: t, Valid: true}
+			}
 		}
 
 		records = append(records, &record)
@@ -447,6 +467,46 @@ func (d *Database) GetRevokedCertificatesByIssuer(issuerSubject string) ([]*Cert
 
 	logger.Info("найдено %d отозванных сертификатов для издателя %s", len(records), issuerSubject)
 	return records, nil
+}
+
+func (d *Database) GetCertificateStatus(serialHex string) (string, error) {
+	serialHex = strings.ToLower(serialHex)
+	var status string
+	err := d.DB.QueryRow("SELECT status FROM certificates WHERE serial_hex = ?", serialHex).Scan(&status)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("ошибка получения статуса: %w", err)
+	}
+	return status, nil
+}
+
+func (d *Database) GetRevocationInfo(serialHex string) (revocationTime time.Time, reason string, err error) {
+	serialHex = strings.ToLower(serialHex)
+	var revocationDateStr sql.NullString
+	var revocationReason sql.NullString
+
+	err = d.DB.QueryRow(
+		"SELECT revocation_date, revocation_reason FROM certificates WHERE serial_hex = ? AND status = 'revoked'",
+		serialHex,
+	).Scan(&revocationDateStr, &revocationReason)
+
+	if err == sql.ErrNoRows {
+		return time.Time{}, "", nil
+	}
+	if err != nil {
+		return time.Time{}, "", fmt.Errorf("ошибка получения информации об отзыве: %w", err)
+	}
+
+	if revocationDateStr.Valid {
+		revocationTime, _ = parseRevocationDate(revocationDateStr.String)
+	}
+	if revocationReason.Valid {
+		reason = revocationReason.String
+	}
+
+	return revocationTime, reason, nil
 }
 
 func ParseCertFromPEM(pemData string) (*x509.Certificate, error) {

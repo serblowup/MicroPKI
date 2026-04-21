@@ -1,4 +1,4 @@
-.PHONY: build clean test test-short test-integration scripts verify help db-init serve revoke gen-crl check-revoked test-crl test-revocation
+.PHONY: build clean test test-short test-integration scripts verify help db-init serve revoke gen-crl check-revoked test-crl test-revocation issue-ocsp-cert ocsp-serve test-ocsp test-ocsp-full
 
 BINARY_NAME=micropki
 BIN_DIR=bin
@@ -20,6 +20,18 @@ SERIAL?=
 REASON?=unspecified
 CA?=intermediate
 NEXT_UPDATE?=7
+
+SUBJECT?=
+CA_CERT?=
+CA_KEY?=
+CA_PASS?=
+SAN?=
+OUT_DIR?=./pki/ocsp
+OCSP_HOST?=127.0.0.1
+OCSP_PORT?=8081
+RESPONDER_CERT?=
+RESPONDER_KEY?=
+CACHE_TTL?=60
 
 build:
 	@echo "Сборка $(BINARY_NAME)..."
@@ -73,6 +85,14 @@ test-crl:
 test-revocation:
 	@echo "Запуск тестов отзыва..."
 	$(GOTEST) -v ./tests/revocation_test.go
+
+test-ocsp:
+	@echo "Запуск тестов OCSP..."
+	$(GOTEST) -v ./tests/ocsp_test.go
+
+test-ocsp-full:
+	@echo "Запуск полных тестов OCSP..."
+	$(GOTEST) -v ./tests/ -run TestOCSP
 
 db-init:
 	@echo "Инициализация базы данных..."
@@ -132,6 +152,32 @@ check-revoked:
 		exit 1; \
 	fi
 	./$(BIN_DIR)/$(BINARY_NAME) ca check-revoked $(SERIAL)
+
+issue-ocsp-cert:
+	@echo "Выпуск сертификата OCSP-ответчика..."
+	@if [ -z "$(SUBJECT)" ]; then \
+		echo "Ошибка: необходимо указать SUBJECT"; \
+		echo "Пример: make issue-ocsp-cert SUBJECT=\"CN=OCSP Responder\" CA_CERT=./pki/certs/intermediate.cert.pem CA_KEY=./pki/private/intermediate.key.pem CA_PASS=./inter.pass"; \
+		exit 1; \
+	fi
+	./$(BIN_DIR)/$(BINARY_NAME) ca issue-ocsp-cert \
+		--ca-cert $(CA_CERT) \
+		--ca-key $(CA_KEY) \
+		--ca-pass-file $(CA_PASS) \
+		--subject "$(SUBJECT)" \
+		--san $(SAN) \
+		--out-dir $(OUT_DIR)
+
+ocsp-serve:
+	@echo "Запуск OCSP-ответчика..."
+	./$(BIN_DIR)/$(BINARY_NAME) ocsp serve \
+		--host $(OCSP_HOST) \
+		--port $(OCSP_PORT) \
+		--db-path $(DB_PATH) \
+		--responder-cert $(RESPONDER_CERT) \
+		--responder-key $(RESPONDER_KEY) \
+		--ca-cert $(CA_CERT) \
+		--cache-ttl $(CACHE_TTL)
 
 scripts:
 	@echo "Запуск всех скриптов..."
@@ -214,6 +260,38 @@ examples:
 	@echo "11. Проверка CRL через OpenSSL:"
 	@echo "   openssl crl -inform PEM -in ./pki/crl/intermediate.crl.pem -text -noout"
 	@echo "   openssl crl -inform PEM -in ./pki/crl/intermediate.crl.pem -CAfile ./pki/certs/intermediate.cert.pem -noout"
+	@echo ""
+	@echo "12. OCSP:"
+	@echo "   a) Выпуск сертификата OCSP-ответчика:"
+	@echo "      ./bin/micropki ca issue-ocsp-cert \\"
+	@echo "          --ca-cert ./pki/certs/intermediate.cert.pem \\"
+	@echo "          --ca-key ./pki/private/intermediate.key.pem \\"
+	@echo "          --ca-pass-file ./inter.pass \\"
+	@echo "          --subject \"CN=OCSP Responder\" \\"
+	@echo "          --san dns:localhost \\"
+	@echo "          --out-dir ./pki/ocsp"
+	@echo ""
+	@echo "   b) Запуск OCSP-ответчика:"
+	@echo "      ./bin/micropki ocsp serve \\"
+	@echo "          --host 127.0.0.1 \\"
+	@echo "          --port 8081 \\"
+	@echo "          --db-path ./pki/micropki.db \\"
+	@echo "          --responder-cert ./pki/ocsp/ocsp.cert.pem \\"
+	@echo "          --responder-key ./pki/ocsp/ocsp.key.pem \\"
+	@echo "          --ca-cert ./pki/certs/intermediate.cert.pem"
+	@echo ""
+	@echo "   c) Проверка через OpenSSL:"
+	@echo "      openssl ocsp -issuer ./pki/certs/intermediate.cert.pem \\"
+	@echo "          -cert ./pki/certs/server.cert.pem \\"
+	@echo "          -url http://127.0.0.1:8081/ \\"
+	@echo "          -resp_text"
+	@echo ""
+	@echo "   d) Проверка с nonce:"
+	@echo "      openssl ocsp -issuer ./pki/certs/intermediate.cert.pem \\"
+	@echo "          -cert ./pki/certs/server.cert.pem \\"
+	@echo "          -url http://127.0.0.1:8081/ \\"
+	@echo "          -nonce \\"
+	@echo "          -resp_text"
 
 help:
 	@echo "Доступные команды:"
@@ -229,6 +307,8 @@ help:
 	@echo "  make test-repo      - запуск тестов репозитория"
 	@echo "  make test-crl       - запуск тестов CRL"
 	@echo "  make test-revocation - запуск тестов отзыва"
+	@echo "  make test-ocsp      - запуск тестов OCSP"
+	@echo "  make test-ocsp-full - запуск полных тестов OCSP"
 	@echo "  make verify         - проверка кода (fmt, vet, mod verify)"
 	@echo "  make deps           - установка зависимостей"
 	@echo ""
@@ -243,6 +323,10 @@ help:
 	@echo "  make gen-crl-root NEXT_UPDATE=<days> - генерация CRL корневого УЦ"
 	@echo "  make gen-crl-intermediate NEXT_UPDATE=<days> - генерация CRL промежуточного УЦ"
 	@echo "  make check-revoked SERIAL=<hex> - проверка статуса отзыва"
+	@echo ""
+	@echo "OCSP:"
+	@echo "  make issue-ocsp-cert SUBJECT=<subject> CA_CERT=<path> CA_KEY=<path> CA_PASS=<path> - выпуск сертификата OCSP-ответчика"
+	@echo "  make ocsp-serve RESPONDER_CERT=<path> RESPONDER_KEY=<path> CA_CERT=<path> - запуск OCSP-ответчика"
 	@echo ""
 	@echo "HTTP сервер:"
 	@echo "  make serve          - запуск HTTP сервера (127.0.0.1)"
