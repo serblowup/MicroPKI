@@ -25,6 +25,7 @@ import (
 	"MicroPKI/internal/ca"
 	"MicroPKI/internal/certs"
 	"MicroPKI/internal/chain"
+	"MicroPKI/internal/client"
 	"MicroPKI/internal/crl"
 	"MicroPKI/internal/cryptoutil"
 	"MicroPKI/internal/csr"
@@ -35,6 +36,7 @@ import (
 	"MicroPKI/internal/revocation"
 	"MicroPKI/internal/san"
 	"MicroPKI/internal/templates"
+	"MicroPKI/internal/validation"
 )
 
 var (
@@ -170,6 +172,7 @@ var (
 	crlFile         string
 	nextUpdateDays  int
 	caName          string
+	outCRLFile      string // НОВАЯ переменная для CRL
 
 	ocspCmd = &cobra.Command{
 		Use:   "ocsp",
@@ -202,12 +205,74 @@ var (
 	ocspResponderKey  string
 	ocspCACert        string
 	ocspCacheTTL      int
+
+	// Клиентские команды
+	clientCmd = &cobra.Command{
+		Use:   "client",
+		Short: "Клиентские операции PKI",
+		Long:  "Генерация CSR, запрос сертификатов, валидация и проверка статуса",
+	}
+	
+	clientGenCSRCmd = &cobra.Command{
+		Use:   "gen-csr",
+		Short: "Генерация приватного ключа и CSR",
+		RunE:  runClientGenCSR,
+	}
+	
+	clientRequestCertCmd = &cobra.Command{
+		Use:   "request-cert",
+		Short: "Запрос сертификата у CA",
+		RunE:  runClientRequestCert,
+	}
+	
+	clientValidateCmd = &cobra.Command{
+		Use:   "validate",
+		Short: "Валидация цепочки сертификатов",
+		RunE:  runClientValidate,
+	}
+	
+	clientCheckStatusCmd = &cobra.Command{
+		Use:   "check-status",
+		Short: "Проверка статуса отзыва сертификата",
+		RunE:  runClientCheckStatus,
+	}
+	
+	// Флаги для client gen-csr
+	csrSubject    string
+	csrKeyType    string
+	csrKeySize    int
+	csrSANs       []string
+	csrOutKey     string
+	csrOutCSR     string
+	
+	// Флаги для client request-cert
+	reqCSRPath    string
+	reqTemplate   string
+	reqCAURL      string
+	reqOutCert    string
+	reqAPIKey     string
+	
+	// Флаги для client validate
+	valCert       string
+	valUntrusted  []string
+	valTrusted    string
+	valCRL        string
+	valOCSP       bool
+	valMode       string
+	valTime       string
+	
+	// Флаги для client check-status
+	chkCert       string
+	chkCACert     string
+	chkCRL        string
+	chkOCSPURL    string
 )
 
 func init() {
 	rootCmd.AddCommand(caCmd)
 	rootCmd.AddCommand(dbCmd)
 	rootCmd.AddCommand(repoCmd)
+	rootCmd.AddCommand(clientCmd)
 	
 	caCmd.AddCommand(caInitCmd)
 	caCmd.AddCommand(caIssueIntermediateCmd)
@@ -223,6 +288,11 @@ func init() {
 	
 	repoCmd.AddCommand(repornServeCmd)
 	repoCmd.AddCommand(repoStatusCmd)
+
+	clientCmd.AddCommand(clientGenCSRCmd)
+	clientCmd.AddCommand(clientRequestCertCmd)
+	clientCmd.AddCommand(clientValidateCmd)
+	clientCmd.AddCommand(clientCheckStatusCmd)
 
 	caInitCmd.Flags().StringVar(&subject, "subject", "", "Distinguished Name (e.g., /CN=My Root CA)")
 	caInitCmd.Flags().StringVar(&keyType, "key-type", "rsa", "Тип ключа: rsa или ecc")
@@ -298,7 +368,7 @@ func init() {
 
 	caGenCRLCmd.Flags().StringVar(&caName, "ca", "", "УЦ: root или intermediate (или путь к сертификату)")
 	caGenCRLCmd.Flags().IntVar(&nextUpdateDays, "next-update", 7, "Дней до следующего обновления CRL")
-	caGenCRLCmd.Flags().StringVar(&outDir, "out-file", "", "Выходной файл CRL")
+	caGenCRLCmd.Flags().StringVar(&outCRLFile, "out-file", "", "Выходной файл CRL")
 	caGenCRLCmd.Flags().StringVar(&logFile, "log-file", "", "Файл для логов")
 	caGenCRLCmd.Flags().StringVar(&logJSON, "log-json", "", "Файл для JSON логов аудита")
 	caGenCRLCmd.Flags().StringVar(&dbPath, "db-path", "./pki/micropki.db", "Путь к SQLite базе данных")
@@ -375,6 +445,46 @@ func init() {
 	ocspServeCmd.MarkFlagRequired("responder-cert")
 	ocspServeCmd.MarkFlagRequired("responder-key")
 	ocspServeCmd.MarkFlagRequired("ca-cert")
+
+	// client gen-csr flags
+	clientGenCSRCmd.Flags().StringVar(&csrSubject, "subject", "", "Distinguished Name (обязательно)")
+	clientGenCSRCmd.Flags().StringVar(&csrKeyType, "key-type", "rsa", "Тип ключа: rsa или ecc")
+	clientGenCSRCmd.Flags().IntVar(&csrKeySize, "key-size", 2048, "Размер ключа (RSA: 2048/4096, ECC: 256/384)")
+	clientGenCSRCmd.Flags().StringSliceVar(&csrSANs, "san", []string{}, "Альтернативные имена (dns:example.com,ip:1.2.3.4)")
+	clientGenCSRCmd.Flags().StringVar(&csrOutKey, "out-key", "./key.pem", "Выходной файл ключа")
+	clientGenCSRCmd.Flags().StringVar(&csrOutCSR, "out-csr", "./request.csr.pem", "Выходной файл CSR")
+	clientGenCSRCmd.Flags().StringVar(&logFile, "log-file", "", "Файл для логов")
+	clientGenCSRCmd.MarkFlagRequired("subject")
+	
+	// client request-cert flags
+	clientRequestCertCmd.Flags().StringVar(&reqCSRPath, "csr", "", "Путь к CSR файлу (обязательно)")
+	clientRequestCertCmd.Flags().StringVar(&reqTemplate, "template", "", "Шаблон: server, client, code_signing (обязательно)")
+	clientRequestCertCmd.Flags().StringVar(&reqCAURL, "ca-url", "http://localhost:8080", "URL CA сервера")
+	clientRequestCertCmd.Flags().StringVar(&reqOutCert, "out-cert", "./cert.pem", "Выходной файл сертификата")
+	clientRequestCertCmd.Flags().StringVar(&reqAPIKey, "api-key", "", "API ключ (опционально)")
+	clientRequestCertCmd.Flags().StringVar(&logFile, "log-file", "", "Файл для логов")
+	clientRequestCertCmd.MarkFlagRequired("csr")
+	clientRequestCertCmd.MarkFlagRequired("template")
+	
+	// client validate flags
+	clientValidateCmd.Flags().StringVar(&valCert, "cert", "", "Путь к конечному сертификату (обязательно)")
+	clientValidateCmd.Flags().StringSliceVar(&valUntrusted, "untrusted", []string{}, "Промежуточные сертификаты")
+	clientValidateCmd.Flags().StringVar(&valTrusted, "trusted", "./pki/certs/ca.cert.pem", "Доверенные корневые сертификаты")
+	clientValidateCmd.Flags().StringVar(&valCRL, "crl", "", "CRL файл или URL")
+	clientValidateCmd.Flags().BoolVar(&valOCSP, "ocsp", false, "Проверять через OCSP")
+	clientValidateCmd.Flags().StringVar(&valMode, "mode", "full", "Режим: chain или full")
+	clientValidateCmd.Flags().StringVar(&valTime, "validation-time", "", "Время валидации (RFC3339)")
+	clientValidateCmd.Flags().StringVar(&logFile, "log-file", "", "Файл для логов")
+	clientValidateCmd.MarkFlagRequired("cert")
+	
+	// client check-status flags
+	clientCheckStatusCmd.Flags().StringVar(&chkCert, "cert", "", "Путь к сертификату (обязательно)")
+	clientCheckStatusCmd.Flags().StringVar(&chkCACert, "ca-cert", "", "Сертификат издателя (обязательно)")
+	clientCheckStatusCmd.Flags().StringVar(&chkCRL, "crl", "", "CRL файл или URL")
+	clientCheckStatusCmd.Flags().StringVar(&chkOCSPURL, "ocsp-url", "", "URL OCSP ответчика")
+	clientCheckStatusCmd.Flags().StringVar(&logFile, "log-file", "", "Файл для логов")
+	clientCheckStatusCmd.MarkFlagRequired("cert")
+	clientCheckStatusCmd.MarkFlagRequired("ca-cert")
 }
 
 func openDatabase(dbPath string) (*database.Database, error) {
@@ -549,11 +659,11 @@ func runCAGenCRL(cmd *cobra.Command, args []string) error {
 		case "root":
 			certPath = filepath.Join(filepath.Dir(dbPath), "certs", "ca.cert.pem")
 			keyPath = filepath.Join(filepath.Dir(dbPath), "private", "ca.key.pem")
-			passPath = filepath.Join(filepath.Dir(dbPath), "..", "root.pass")
+			passPath = filepath.Join(filepath.Dir(dbPath), "root.pass")
 		case "intermediate":
 			certPath = filepath.Join(filepath.Dir(dbPath), "certs", "intermediate.cert.pem")
 			keyPath = filepath.Join(filepath.Dir(dbPath), "private", "intermediate.key.pem")
-			passPath = filepath.Join(filepath.Dir(dbPath), "..", "inter.pass")
+			passPath = filepath.Join(filepath.Dir(dbPath), "inter.pass")
 		default:
 			return fmt.Errorf("неизвестный УЦ: %s. Используйте root, intermediate или укажите --ca-cert, --ca-key, --ca-pass-file", caName)
 		}
@@ -641,14 +751,20 @@ func runCAGenCRL(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("ошибка генерации CRL: %w", err)
 	}
 
-	crlDir := filepath.Join(filepath.Dir(dbPath), "crl")
+	// Определяем директорию для CRL
+	baseDir := filepath.Dir(dbPath)
+	crlDir := filepath.Join(baseDir, "crl")
 	if err := os.MkdirAll(crlDir, 0755); err != nil {
 		return fmt.Errorf("ошибка создания директории crl: %w", err)
 	}
 
 	var crlPath string
-	if outDir != "" {
-		crlPath = outDir
+	if outCRLFile != "" {
+		crlPath = outCRLFile
+		// Убеждаемся, что родительская директория существует
+		if err := os.MkdirAll(filepath.Dir(crlPath), 0755); err != nil {
+			return fmt.Errorf("ошибка создания директории для CRL: %w", err)
+		}
 	} else {
 		crlPath = filepath.Join(crlDir, fmt.Sprintf("%s.crl.pem", caName))
 	}
@@ -1430,6 +1546,7 @@ func runRepoServe(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  - GET  /certificate/{serial} - получить сертификат по серийному номеру\n")
 	fmt.Printf("  - GET  /ca/root               - получить корневой сертификат CA\n")
 	fmt.Printf("  - GET  /ca/intermediate       - получить промежуточный сертификат CA\n")
+	fmt.Printf("  - POST /request-cert          - запрос сертификата из CSR\n")
 	fmt.Printf("  - GET  /crl                   - получить CRL (параметр ?ca=root|intermediate)\n")
 	fmt.Printf("  - GET  /health                - проверка работоспособности\n")
 	fmt.Printf("\nДля остановки нажмите Ctrl+C\n")
@@ -1888,6 +2005,298 @@ func runOCSPServe(cmd *cobra.Command, args []string) error {
 
 	logger.Info("OCSP-ответчик остановлен")
 	return nil
+}
+
+func runClientGenCSR(cmd *cobra.Command, args []string) error {
+	if err := logger.Init(logFile, logJSON); err != nil {
+		return fmt.Errorf("ошибка инициализации логгера: %w", err)
+	}
+	defer logger.Close()
+	
+	client.InitClientLogger("")
+	defer client.CloseClientLogger()
+	
+	cfg := &client.CSRConfig{
+		Subject: csrSubject,
+		KeyType: csrKeyType,
+		KeySize: csrKeySize,
+		SANs:    csrSANs,
+		OutKey:  csrOutKey,
+		OutCSR:  csrOutCSR,
+	}
+	
+	logger.Info("генерация CSR: subject=%s, key-type=%s, key-size=%d", csrSubject, csrKeyType, csrKeySize)
+	
+	generated, err := client.GenerateCSR(cfg)
+	if err != nil {
+		client.LogClientOperation("gen_csr", map[string]interface{}{
+			"subject": csrSubject,
+		}, err)
+		return err
+	}
+	
+	if err := client.SaveCSR(generated, csrOutKey, csrOutCSR); err != nil {
+		client.LogClientOperation("gen_csr", map[string]interface{}{
+			"subject": csrSubject,
+		}, err)
+		return err
+	}
+	
+	client.LogClientOperation("gen_csr", map[string]interface{}{
+		"subject":  csrSubject,
+		"key_file": csrOutKey,
+		"csr_file": csrOutCSR,
+	}, nil)
+	
+	fmt.Printf("ВНИМАНИЕ: Закрытый ключ сохранен незашифрованным: %s\n", csrOutKey)
+	fmt.Printf("CSR успешно сгенерирован:\n")
+	fmt.Printf("  Ключ: %s\n", csrOutKey)
+	fmt.Printf("  CSR:  %s\n", csrOutCSR)
+	
+	return nil
+}
+
+func runClientRequestCert(cmd *cobra.Command, args []string) error {
+	if err := logger.Init(logFile, logJSON); err != nil {
+		return fmt.Errorf("ошибка инициализации логгера: %w", err)
+	}
+	defer logger.Close()
+	
+	client.InitClientLogger("")
+	defer client.CloseClientLogger()
+	
+	req := &client.CertificateRequest{
+		CSRPath:  reqCSRPath,
+		Template: reqTemplate,
+		CAURL:    reqCAURL,
+		OutCert:  reqOutCert,
+		APIKey:   reqAPIKey,
+	}
+	
+	logger.Info("запрос сертификата: csr=%s, template=%s, ca=%s", reqCSRPath, reqTemplate, reqCAURL)
+	
+	if err := client.RequestCertificate(req); err != nil {
+		client.LogClientOperation("request_cert", map[string]interface{}{
+			"csr":      reqCSRPath,
+			"template": reqTemplate,
+			"ca_url":   reqCAURL,
+		}, err)
+		return err
+	}
+	
+	client.LogClientOperation("request_cert", map[string]interface{}{
+		"csr":      reqCSRPath,
+		"template": reqTemplate,
+		"ca_url":   reqCAURL,
+		"out_cert": reqOutCert,
+	}, nil)
+	
+	fmt.Printf("Сертификат успешно получен и сохранен: %s\n", reqOutCert)
+	
+	return nil
+}
+
+func runClientValidate(cmd *cobra.Command, args []string) error {
+	if err := logger.Init(logFile, logJSON); err != nil {
+		return fmt.Errorf("ошибка инициализации логгера: %w", err)
+	}
+	defer logger.Close()
+	
+	leaf, err := chain.LoadCertificate(valCert)
+	if err != nil {
+		return fmt.Errorf("ошибка загрузки конечного сертификата: %w", err)
+	}
+	
+	builder := validation.NewChainBuilder()
+	
+	trustedCerts, err := loadCertificatesFromFile(valTrusted)
+	if err != nil {
+		return fmt.Errorf("ошибка загрузки доверенных сертификатов: %w", err)
+	}
+	for _, cert := range trustedCerts {
+		builder.AddTrustedRoot(cert)
+	}
+	
+	for _, untrustedPath := range valUntrusted {
+		interCerts, err := loadCertificatesFromFile(untrustedPath)
+		if err != nil {
+			return fmt.Errorf("ошибка загрузки промежуточных сертификатов: %w", err)
+		}
+		for _, cert := range interCerts {
+			builder.AddIntermediate(cert)
+		}
+	}
+	
+	path, err := builder.BuildChain(leaf)
+	if err != nil {
+		return fmt.Errorf("ошибка построения цепочки: %w", err)
+	}
+	
+	fmt.Printf("Построена цепочка из %d сертификатов:\n", len(path))
+	for i, cert := range path {
+		fmt.Printf("  %d: %s\n", i+1, cert.Subject.String())
+	}
+	
+	var currentTime time.Time
+	if valTime != "" {
+		currentTime, err = time.Parse(time.RFC3339, valTime)
+		if err != nil {
+			return fmt.Errorf("неверный формат времени: %w", err)
+		}
+	}
+	
+	validator := validation.NewPathValidator(validation.ValidationOptions{
+		CurrentTime: currentTime,
+	})
+	
+	result, err := validator.ValidatePath(path)
+	if err != nil {
+		fmt.Printf("\nВалидация провалена: %v\n", err)
+		
+		for _, step := range result.Steps {
+			status := "YES"
+			if !step.Passed {
+				status = "NO"
+			}
+			if step.Error != "" {
+				fmt.Printf("  %s %s: %s\n", status, step.Check, step.Error)
+			}
+		}
+		return err
+	}
+	
+	fmt.Println("\nЦепочка сертификатов валидна!")
+	
+	if valMode == "full" && (valOCSP || valCRL != "") {
+		fmt.Println("\nПроверка статуса отзыва...")
+		
+		if len(path) < 2 {
+			fmt.Println("  Недостаточно сертификатов для проверки отзыва")
+		} else {
+			issuer := path[1]
+			
+			checker := revocation.NewRevocationChecker()
+			revResult, err := checker.CheckStatus(&revocation.RevocationCheckOptions{
+				Cert:          leaf,
+				Issuer:        issuer,
+				CRLSource:     valCRL,
+				PreferOCSP:    valOCSP,
+				FallbackToCRL: valCRL != "",
+			})
+			
+			if err != nil {
+				fmt.Printf("  Ошибка проверки отзыва: %v\n", err)
+			} else {
+				fmt.Printf("  Метод: %s\n", revResult.Method)
+				fmt.Printf("  Статус: %s\n", revResult.Status)
+				if revResult.Status == "revoked" {
+					fmt.Printf("  Дата отзыва: %s\n", revResult.RevokedAt.Format(time.RFC3339))
+					fmt.Printf("  Причина: %s\n", revResult.Reason)
+				}
+				if revResult.Error != "" {
+					fmt.Printf("  Предупреждение: %s\n", revResult.Error)
+				}
+			}
+			
+			result.Revocation = revResult
+		}
+	}
+	
+	if logJSON != "" {
+		jsonData, _ := result.ToJSON()
+		os.WriteFile(logJSON, jsonData, 0644)
+	}
+	
+	return nil
+}
+
+func runClientCheckStatus(cmd *cobra.Command, args []string) error {
+	if err := logger.Init(logFile, logJSON); err != nil {
+		return fmt.Errorf("ошибка инициализации логгера: %w", err)
+	}
+	defer logger.Close()
+	
+	cert, err := chain.LoadCertificate(chkCert)
+	if err != nil {
+		return fmt.Errorf("ошибка загрузки сертификата: %w", err)
+	}
+	
+	issuer, err := chain.LoadCertificate(chkCACert)
+	if err != nil {
+		return fmt.Errorf("ошибка загрузки сертификата издателя: %w", err)
+	}
+	
+	fmt.Printf("Проверка статуса сертификата:\n")
+	fmt.Printf("  Subject: %s\n", cert.Subject.String())
+	fmt.Printf("  Serial:  %x\n", cert.SerialNumber)
+	
+	ocspURL := chkOCSPURL
+	preferOCSP := ocspURL != ""
+	if !preferOCSP {
+		ocspURL, _ = validation.ExtractOCSPURL(cert)
+		preferOCSP = ocspURL != ""
+	}
+	
+	checker := revocation.NewRevocationChecker()
+	result, err := checker.CheckStatus(&revocation.RevocationCheckOptions{
+		Cert:          cert,
+		Issuer:        issuer,
+		OCSPURL:       ocspURL,
+		CRLSource:     chkCRL,
+		PreferOCSP:    preferOCSP,
+		FallbackToCRL: true,
+	})
+	
+	if err != nil {
+		return fmt.Errorf("ошибка проверки: %w", err)
+	}
+	
+	fmt.Printf("\nРезультат проверки:\n")
+	if result.Method != "" {
+		fmt.Printf("  Метод:  %s\n", result.Method)
+	}
+	fmt.Printf("  Статус: %s\n", result.Status)
+	
+	if result.Status == "revoked" {
+		fmt.Printf("  Отозван: %s\n", result.RevokedAt.Format(time.RFC3339))
+		fmt.Printf("  Причина: %s\n", result.Reason)
+	}
+	
+	if result.Error != "" {
+		fmt.Printf("  Предупреждение: %s\n", result.Error)
+	}
+	
+	return nil
+}
+
+func loadCertificatesFromFile(path string) ([]*x509.Certificate, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	
+	var certs []*x509.Certificate
+	var block *pem.Block
+	
+	for {
+		block, data = pem.Decode(data)
+		if block == nil {
+			break
+		}
+		if block.Type == "CERTIFICATE" {
+			cert, err := x509.ParseCertificate(block.Bytes)
+			if err != nil {
+				continue
+			}
+			certs = append(certs, cert)
+		}
+	}
+	
+	if len(certs) == 0 {
+		return nil, fmt.Errorf("не найдено ни одного сертификата в файле")
+	}
+	
+	return certs, nil
 }
 
 func main() {

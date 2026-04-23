@@ -1,4 +1,4 @@
-.PHONY: build clean test test-short test-integration scripts verify help db-init serve revoke gen-crl check-revoked test-crl test-revocation issue-ocsp-cert ocsp-serve test-ocsp test-ocsp-full
+.PHONY: build clean test test-short test-integration scripts verify help db-init serve revoke gen-crl check-revoked test-crl test-revocation issue-ocsp-cert ocsp-serve test-ocsp test-ocsp-full test-csr csr request-cert validate check-status
 
 BINARY_NAME=micropki
 BIN_DIR=bin
@@ -32,6 +32,23 @@ OCSP_PORT?=8081
 RESPONDER_CERT?=
 RESPONDER_KEY?=
 CACHE_TTL?=60
+
+# Клиентские переменные
+KEY_TYPE?=rsa
+KEY_SIZE?=2048
+OUT_KEY?=./key.pem
+OUT_CSR?=./request.csr.pem
+CSR?=
+TEMPLATE?=
+CA_URL?=http://localhost:8080
+OUT_CERT?=./cert.pem
+CERT?=
+UNTRUSTED?=
+TRUSTED?=./pki/certs/ca.cert.pem
+CRL?=
+OCSP?=false
+MODE?=full
+OCSP_URL?=
 
 build:
 	@echo "Сборка $(BINARY_NAME)..."
@@ -94,6 +111,23 @@ test-ocsp-full:
 	@echo "Запуск полных тестов OCSP..."
 	$(GOTEST) -v ./tests/ -run TestOCSP
 
+test-csr:
+	@echo "Запуск тестов CSR и клиент:"
+	@echo ""
+	@echo "Клиентские тесты..."
+	@$(GOTEST) -v ./tests/client_test.go || exit 1
+	@echo ""
+	@echo "Тесты валидации..."
+	@$(GOTEST) -v ./tests/validation_test.go || exit 1
+	@echo ""
+	@echo "Интеграционные тесты отзыва..."
+	@$(GOTEST) -v ./tests/revocation_integration_test.go || exit 1
+	@echo ""
+	@echo "E2E тесты..."
+	@$(GOTEST) -v ./tests/e2e_test.go || exit 1
+	@echo ""
+	@echo "Все тесты Спринта 6 пройдены!"
+
 db-init:
 	@echo "Инициализация базы данных..."
 	./$(BIN_DIR)/$(BINARY_NAME) db init --db-path ./pki/micropki.db
@@ -153,6 +187,62 @@ check-revoked:
 	fi
 	./$(BIN_DIR)/$(BINARY_NAME) ca check-revoked $(SERIAL)
 
+csr:
+	@echo "Генерация CSR..."
+	@if [ -z "$(SUBJECT)" ]; then \
+		echo "Ошибка: необходимо указать SUBJECT"; \
+		echo "Пример: make csr SUBJECT=\"/CN=example.com\" SAN=\"dns:example.com\""; \
+		exit 1; \
+	fi
+	./$(BIN_DIR)/$(BINARY_NAME) client gen-csr \
+		--subject "$(SUBJECT)" \
+		--key-type $(KEY_TYPE) \
+		--key-size $(KEY_SIZE) \
+		--san $(SAN) \
+		--out-key $(OUT_KEY) \
+		--out-csr $(OUT_CSR)
+
+request-cert:
+	@echo "Запрос сертификата..."
+	@if [ -z "$(CSR)" ] || [ -z "$(TEMPLATE)" ]; then \
+		echo "Ошибка: необходимо указать CSR и TEMPLATE"; \
+		echo "Пример: make request-cert CSR=./request.csr.pem TEMPLATE=server CA_URL=http://localhost:8080"; \
+		exit 1; \
+	fi
+	./$(BIN_DIR)/$(BINARY_NAME) client request-cert \
+		--csr $(CSR) \
+		--template $(TEMPLATE) \
+		--ca-url $(CA_URL) \
+		--out-cert $(OUT_CERT)
+
+validate:
+	@echo "Валидация цепочки сертификатов..."
+	@if [ -z "$(CERT)" ]; then \
+		echo "Ошибка: необходимо указать CERT"; \
+		echo "Пример: make validate CERT=./cert.pem TRUSTED=./ca.pem"; \
+		exit 1; \
+	fi
+	./$(BIN_DIR)/$(BINARY_NAME) client validate \
+		--cert $(CERT) \
+		--untrusted $(UNTRUSTED) \
+		--trusted $(TRUSTED) \
+		--crl $(CRL) \
+		--ocsp=$(OCSP) \
+		--mode $(MODE)
+
+check-status:
+	@echo "Проверка статуса отзыва..."
+	@if [ -z "$(CERT)" ] || [ -z "$(CA_CERT)" ]; then \
+		echo "Ошибка: необходимо указать CERT и CA_CERT"; \
+		echo "Пример: make check-status CERT=./cert.pem CA_CERT=./ca.pem"; \
+		exit 1; \
+	fi
+	./$(BIN_DIR)/$(BINARY_NAME) client check-status \
+		--cert $(CERT) \
+		--ca-cert $(CA_CERT) \
+		--crl $(CRL) \
+		--ocsp-url $(OCSP_URL)
+
 issue-ocsp-cert:
 	@echo "Выпуск сертификата OCSP-ответчика..."
 	@if [ -z "$(SUBJECT)" ]; then \
@@ -208,6 +298,8 @@ deps:
 examples:
 	@echo "Примеры использования:"
 	@echo ""
+	@echo "Базовые операции"
+	@echo ""
 	@echo "1. Инициализация БД:"
 	@echo "   make db-init"
 	@echo ""
@@ -233,84 +325,70 @@ examples:
 	@echo "       --subject \"/CN=example.com\" \\"
 	@echo "       --san dns:example.com"
 	@echo ""
-	@echo "5. Отзыв сертификата:"
-	@echo "   make revoke SERIAL=\$$(./bin/micropki ca list-certs --format json | jq -r '.[0].serial_hex') REASON=keyCompromise"
+	@echo "Клиентские команды"
 	@echo ""
-	@echo "6. Генерация CRL:"
-	@echo "   make gen-crl CA=intermediate NEXT_UPDATE=14"
+	@echo "5. Генерация CSR:"
+	@echo "   make csr SUBJECT=\"/CN=app.example.com\" SAN=\"dns:app.example.com\""
 	@echo ""
-	@echo "7. Проверка статуса отзыва:"
-	@echo "   make check-revoked SERIAL=0baee839362091a1"
+	@echo "6. Запрос сертификата:"
+	@echo "   make request-cert CSR=./request.csr.pem TEMPLATE=server"
 	@echo ""
-	@echo "8. Просмотр сертификатов:"
-	@echo "   ./bin/micropki ca list-certs --format table"
-	@echo "   ./bin/micropki ca show-cert \$$(./bin/micropki ca list-certs --format json | jq -r '.[0].serial_hex')"
+	@echo "7. Валидация цепочки:"
+	@echo "   make validate CERT=./cert.pem UNTRUSTED=./inter.pem TRUSTED=./ca.pem"
 	@echo ""
-	@echo "9. Запуск HTTP сервера:"
-	@echo "   make serve"
+	@echo "8. Проверка статуса отзыва:"
+	@echo "   make check-status CERT=./cert.pem CA_CERT=./inter.pem"
 	@echo ""
-	@echo "10. Проверка API:"
-	@echo "   curl http://127.0.0.1:8080/health"
-	@echo "   curl http://127.0.0.1:8080/ca/root"
-	@echo "   curl http://127.0.0.1:8080/ca/intermediate"
-	@echo "   curl http://127.0.0.1:8080/crl"
-	@echo "   curl http://127.0.0.1:8080/crl?ca=root"
-	@echo "   curl http://127.0.0.1:8080/crl/intermediate.crl.pem"
+	@echo "Отзыв и CRL"
 	@echo ""
-	@echo "11. Проверка CRL через OpenSSL:"
-	@echo "   openssl crl -inform PEM -in ./pki/crl/intermediate.crl.pem -text -noout"
-	@echo "   openssl crl -inform PEM -in ./pki/crl/intermediate.crl.pem -CAfile ./pki/certs/intermediate.cert.pem -noout"
+	@echo "9. Отзыв сертификата:"
+	@echo "   make revoke SERIAL=0baee839362091a1 REASON=keyCompromise"
 	@echo ""
-	@echo "12. OCSP:"
-	@echo "   a) Выпуск сертификата OCSP-ответчика:"
-	@echo "      ./bin/micropki ca issue-ocsp-cert \\"
-	@echo "          --ca-cert ./pki/certs/intermediate.cert.pem \\"
-	@echo "          --ca-key ./pki/private/intermediate.key.pem \\"
-	@echo "          --ca-pass-file ./inter.pass \\"
-	@echo "          --subject \"CN=OCSP Responder\" \\"
-	@echo "          --san dns:localhost \\"
-	@echo "          --out-dir ./pki/ocsp"
+	@echo "10. Генерация CRL:"
+	@echo "    make gen-crl CA=intermediate NEXT_UPDATE=14"
 	@echo ""
-	@echo "   b) Запуск OCSP-ответчика:"
-	@echo "      ./bin/micropki ocsp serve \\"
-	@echo "          --host 127.0.0.1 \\"
-	@echo "          --port 8081 \\"
-	@echo "          --db-path ./pki/micropki.db \\"
-	@echo "          --responder-cert ./pki/ocsp/ocsp.cert.pem \\"
-	@echo "          --responder-key ./pki/ocsp/ocsp.key.pem \\"
-	@echo "          --ca-cert ./pki/certs/intermediate.cert.pem"
+	@echo "11. Проверка статуса отзыва (CA):"
+	@echo "    make check-revoked SERIAL=0baee839362091a1"
 	@echo ""
-	@echo "   c) Проверка через OpenSSL:"
-	@echo "      openssl ocsp -issuer ./pki/certs/intermediate.cert.pem \\"
-	@echo "          -cert ./pki/certs/server.cert.pem \\"
-	@echo "          -url http://127.0.0.1:8081/ \\"
-	@echo "          -resp_text"
+	@echo "HTTP Репозиторий"
 	@echo ""
-	@echo "   d) Проверка с nonce:"
-	@echo "      openssl ocsp -issuer ./pki/certs/intermediate.cert.pem \\"
-	@echo "          -cert ./pki/certs/server.cert.pem \\"
-	@echo "          -url http://127.0.0.1:8081/ \\"
-	@echo "          -nonce \\"
-	@echo "          -resp_text"
+	@echo "12. Запуск HTTP сервера:"
+	@echo "    make serve"
+	@echo ""
+	@echo "13. Проверка API:"
+	@echo "    curl http://127.0.0.1:8080/health"
+	@echo "    curl http://127.0.0.1:8080/ca/root"
+	@echo "    curl -X POST http://127.0.0.1:8080/request-cert -F \"csr=@app.csr.pem\" -F \"template=server\""
+	@echo ""
+	@echo "Тестирование"
+	@echo ""
+	@echo "14. Запуск всех тестов:"
+	@echo "    make test"
 
 help:
 	@echo "Доступные команды:"
 	@echo ""
 	@echo "Сборка и тестирование:"
-	@echo "  make build          - сборка бинарного файла (предупреждения скрыты)"
+	@echo "  make build          - сборка бинарного файла"
 	@echo "  make build-verbose  - сборка с отображением предупреждений"
 	@echo "  make clean          - очистка временных файлов"
 	@echo "  make test           - запуск всех тестов"
 	@echo "  make test-short     - запуск коротких тестов"
 	@echo "  make test-integration - запуск интеграционных тестов"
+	@echo "  make test-csr       - запуск тестов Спринта 6"
 	@echo "  make test-db        - запуск тестов БД"
 	@echo "  make test-repo      - запуск тестов репозитория"
 	@echo "  make test-crl       - запуск тестов CRL"
 	@echo "  make test-revocation - запуск тестов отзыва"
 	@echo "  make test-ocsp      - запуск тестов OCSP"
-	@echo "  make test-ocsp-full - запуск полных тестов OCSP"
 	@echo "  make verify         - проверка кода (fmt, vet, mod verify)"
 	@echo "  make deps           - установка зависимостей"
+	@echo ""
+	@echo "Клиентские команды:"
+	@echo "  make csr            - генерация CSR"
+	@echo "  make request-cert   - запрос сертификата"
+	@echo "  make validate       - валидация цепочки"
+	@echo "  make check-status   - проверка статуса отзыва"
 	@echo ""
 	@echo "База данных:"
 	@echo "  make db-init        - инициализация БД"

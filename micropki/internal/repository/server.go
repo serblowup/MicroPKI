@@ -39,15 +39,16 @@ func NewServer(host string, port int, db *database.Database, certDir string, crl
 }
 
 func (s *Server) registerRoutes() {
+	// GET endpoints
 	s.router.HandleFunc("GET /certificate/{serial}", s.withLogging(s.handleGetCertificate))
-	
 	s.router.HandleFunc("GET /ca/root", s.withLogging(s.handleGetRootCA))
 	s.router.HandleFunc("GET /ca/intermediate", s.withLogging(s.handleGetIntermediateCA))
-	
 	s.router.HandleFunc("GET /crl", s.withLogging(s.handleCRL))
 	s.router.HandleFunc("GET /crl/{filename}", s.withLogging(s.handleCRLFile))
-	
 	s.router.HandleFunc("GET /health", s.withLogging(s.handleHealth))
+	
+	// POST endpoints
+	s.router.HandleFunc("POST /request-cert", s.withLogging(s.HandleRequestCert))
 }
 
 func (s *Server) Start() error {

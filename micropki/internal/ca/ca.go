@@ -6,8 +6,11 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/asn1"
 	"encoding/pem"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -15,8 +18,11 @@ import (
 
 	"MicroPKI/internal/certs"
 	"MicroPKI/internal/cryptoutil"
+	"MicroPKI/internal/csr"
 	"MicroPKI/internal/database"
 	"MicroPKI/internal/logger"
+	"MicroPKI/internal/san"
+	"MicroPKI/internal/templates"
 )
 
 type RootCA struct {
@@ -85,7 +91,7 @@ func NewIntermediateCA(certPath, keyPath, passphraseFile string, db *database.Da
 		CertPath:       certPath,
 		KeyPath:        keyPath,
 		PassphraseFile: passphraseFile,
-		DB:             db, // НОВОЕ
+		DB:             db,
 	}, nil
 }
 
@@ -357,6 +363,165 @@ func (ica *IntermediateCA) Load() (*x509.Certificate, crypto.Signer, error) {
 	}
 
 	return cert, signer, nil
+}
+
+// IssueCertificateFromCSR выпускает сертификат из CSR (CA-1)
+func (ica *IntermediateCA) IssueCertificateFromCSR(csrData []byte, templateName string, validityDays int) (*x509.Certificate, []byte, error) {
+	// Загружаем CA
+	caCert, caSigner, err := ica.Load()
+	if err != nil {
+		return nil, nil, fmt.Errorf("ошибка загрузки CA: %w", err)
+	}
+
+	// Парсим CSR
+	csrObj, err := csr.ParseCSR(csrData)
+	if err != nil {
+		return nil, nil, fmt.Errorf("ошибка парсинга CSR: %w", err)
+	}
+
+	// Проверяем подпись CSR
+	if err := csrObj.CheckSignature(); err != nil {
+		return nil, nil, fmt.Errorf("неверная подпись CSR: %w", err)
+	}
+
+	// Проверяем, что CSR не запрашивает CA сертификат
+	for _, ext := range csrObj.Extensions {
+		if ext.Id.Equal([]int{2, 5, 29, 19}) { // BasicConstraints
+			var basicConstraints struct {
+				IsCA bool `asn1:"optional"`
+			}
+			if _, err := asn1.Unmarshal(ext.Value, &basicConstraints); err == nil {
+				if basicConstraints.IsCA {
+					return nil, nil, fmt.Errorf("CSR запрашивает CA сертификат, что не разрешено для конечных сертификатов")
+				}
+			}
+		}
+	}
+
+	// Получаем шаблон
+	templateType := templates.TemplateType(templateName)
+	tmpl, err := templates.GetTemplate(templateType)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Извлекаем SAN из CSR
+	var sanEntries []san.SANEntry
+	for _, ext := range csrObj.Extensions {
+		if ext.Id.Equal([]int{2, 5, 29, 17}) { // Subject Alternative Name
+			sanEntries, err = parseSANExtension(ext.Value)
+			if err != nil {
+				logger.Warn("ошибка парсинга SAN из CSR: %v", err)
+			}
+			break
+		}
+	}
+
+	// Валидируем SAN для шаблона
+	if err := templates.ValidateSANsForTemplate(tmpl, sanEntries); err != nil {
+		return nil, nil, fmt.Errorf("неверные SAN для шаблона %s: %w", templateName, err)
+	}
+
+	// Генерируем серийный номер
+	serialNumber, err := certs.GenerateSerialNumber()
+	if err != nil {
+		return nil, nil, fmt.Errorf("ошибка генерации серийного номера: %w", err)
+	}
+
+	// Вычисляем SKI
+	ski, err := certs.CalculateSKI(csrObj.PublicKey)
+	if err != nil {
+		return nil, nil, fmt.Errorf("ошибка вычисления SKI: %w", err)
+	}
+
+	// Создаем шаблон сертификата
+	certTemplate := &x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject:      csrObj.Subject,
+		Issuer:       caCert.Subject,
+		NotBefore:    time.Now().UTC(),
+		NotAfter:     time.Now().UTC().AddDate(0, 0, validityDays),
+
+		KeyUsage:    tmpl.KeyUsage,
+		ExtKeyUsage: tmpl.ExtKeyUsage,
+
+		BasicConstraintsValid: true,
+		IsCA:                  false,
+
+		SubjectKeyId:   ski,
+		AuthorityKeyId: caCert.SubjectKeyId,
+	}
+
+	// Добавляем SAN в сертификат
+	for _, entry := range sanEntries {
+		switch entry.Type {
+		case "dns":
+			certTemplate.DNSNames = append(certTemplate.DNSNames, entry.Value)
+		case "ip":
+			ip := net.ParseIP(entry.Value)
+			if ip != nil {
+				certTemplate.IPAddresses = append(certTemplate.IPAddresses, ip)
+			}
+		case "email":
+			certTemplate.EmailAddresses = append(certTemplate.EmailAddresses, entry.Value)
+		case "uri":
+			if u, err := url.Parse(entry.Value); err == nil {
+				certTemplate.URIs = append(certTemplate.URIs, u)
+			}
+		}
+	}
+
+	// Подписываем сертификат
+	certDER, err := x509.CreateCertificate(rand.Reader, certTemplate, caCert, csrObj.PublicKey, caSigner)
+	if err != nil {
+		return nil, nil, fmt.Errorf("ошибка создания сертификата: %w", err)
+	}
+
+	cert, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: certDER,
+	})
+
+	// Сохраняем в БД
+	if ica.DB != nil {
+		if err := ica.DB.InsertCertificate(cert, certPEM, "valid"); err != nil {
+			logger.Warn("не удалось сохранить сертификат в БД: %v", err)
+		} else {
+			logger.Info("сертификат сохранен в БД: serial=%x", cert.SerialNumber)
+		}
+	}
+
+	return cert, certPEM, nil
+}
+
+// parseSANExtension парсит SAN расширение из CSR
+func parseSANExtension(value []byte) ([]san.SANEntry, error) {
+	var rawValues []asn1.RawValue
+	if _, err := asn1.Unmarshal(value, &rawValues); err != nil {
+		return nil, err
+	}
+
+	var entries []san.SANEntry
+	for _, rv := range rawValues {
+		switch rv.Tag {
+		case 2: // dNSName
+			entries = append(entries, san.SANEntry{Type: "dns", Value: string(rv.Bytes)})
+		case 7: // iPAddress
+			ip := net.IP(rv.Bytes)
+			entries = append(entries, san.SANEntry{Type: "ip", Value: ip.String()})
+		case 1: // rfc822Name
+			entries = append(entries, san.SANEntry{Type: "email", Value: string(rv.Bytes)})
+		case 6: // uniformResourceIdentifier
+			entries = append(entries, san.SANEntry{Type: "uri", Value: string(rv.Bytes)})
+		}
+	}
+
+	return entries, nil
 }
 
 func SaveCertificateToDB(db *database.Database, cert *x509.Certificate, certPEM []byte, status string) error {
