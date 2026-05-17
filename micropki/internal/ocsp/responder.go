@@ -12,6 +12,7 @@ import (
 
 	"MicroPKI/internal/database"
 	"MicroPKI/internal/logger"
+	"MicroPKI/internal/ratelimit"
 	"golang.org/x/crypto/ocsp"
 )
 
@@ -24,6 +25,7 @@ type OCSPResponder struct {
 	cacheTTL      time.Duration
 	host          string
 	port          int
+	rateLimiter   *ratelimit.RateLimiter
 }
 
 func NewOCSPResponder(
@@ -67,11 +69,33 @@ func NewOCSPResponder(
 		cacheTTL:      time.Duration(cacheTTLSeconds) * time.Second,
 		host:          host,
 		port:          port,
+		rateLimiter:   ratelimit.NewRateLimiter(0, 10), // по умолчанию отключен
 	}, nil
+}
+
+// SetRateLimit устанавливает ограничение частоты запросов
+func (r *OCSPResponder) SetRateLimit(rate float64, burst int) {
+	r.rateLimiter = ratelimit.NewRateLimiter(rate, burst)
+	if rate > 0 {
+		logger.Info("[OCSP] включено ограничение частоты: rate=%.1f/s, burst=%d", rate, burst)
+	}
 }
 
 func (r *OCSPResponder) HandleOCSPRequest(w http.ResponseWriter, req *http.Request) {
 	startTime := time.Now()
+
+	// Rate limiting
+	if r.rateLimiter.IsEnabled() {
+		clientIP := req.RemoteAddr
+		if !r.rateLimiter.Allow(clientIP) {
+			retryAfter := r.rateLimiter.GetRetryAfter()
+			w.Header().Set("Retry-After", fmt.Sprintf("%d", retryAfter))
+			w.Header().Set("Content-Type", "application/ocsp-response")
+			w.WriteHeader(http.StatusTooManyRequests)
+			logger.Warn("[OCSP] превышен лимит частоты для %s", clientIP)
+			return
+		}
+	}
 
 	if req.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -114,7 +138,7 @@ func (r *OCSPResponder) HandleOCSPRequest(w http.ResponseWriter, req *http.Reque
 	issuer := r.issuerManager.FindByHashes(ocspReq.IssuerNameHash, ocspReq.IssuerKeyHash)
 	if issuer == nil {
 		logger.Warn("[OCSP] неизвестный эмитент для запроса - возвращаем unknown")
-		
+
 		// Возвращаем ответ со статусом unknown
 		template := ocsp.Response{
 			Status:       ocsp.Unknown,
@@ -122,7 +146,7 @@ func (r *OCSPResponder) HandleOCSPRequest(w http.ResponseWriter, req *http.Reque
 			ThisUpdate:   time.Now().UTC(),
 			NextUpdate:   time.Now().UTC().Add(r.cacheTTL),
 		}
-		
+
 		// Используем загруженный CA сертификат как issuer для ответа unknown
 		respBytes, err := ocsp.CreateResponse(r.caCert, r.signerCert.Certificate, template, r.signerCert.PrivateKey)
 		if err != nil {
@@ -130,14 +154,25 @@ func (r *OCSPResponder) HandleOCSPRequest(w http.ResponseWriter, req *http.Reque
 			r.sendErrorResponse(w, NewInternalError("ошибка создания ответа"))
 			return
 		}
-		
+
 		w.Header().Set("Content-Type", "application/ocsp-response")
 		w.WriteHeader(http.StatusOK)
 		w.Write(respBytes)
-		
+
 		processingTime := time.Since(startTime)
 		logger.Info("[OCSP] ответ: client=%s, serial=%s, status=unknown, time=%v",
 			clientIP, serialHex, processingTime)
+
+		// Аудит
+		logger.LogAuditEvent("ocsp_request", "success",
+			fmt.Sprintf("OCSP request processed: unknown issuer, serial=%s", serialHex),
+			map[string]interface{}{
+				"client_ip":       clientIP,
+				"serial":          serialHex,
+				"status":          "unknown",
+				"processing_time": processingTime.Milliseconds(),
+				"issuer_found":    false,
+			})
 		return
 	}
 
@@ -167,9 +202,6 @@ func (r *OCSPResponder) HandleOCSPRequest(w http.ResponseWriter, req *http.Reque
 		RevocationReason: revocationReason,
 	}
 
-	// Примечание: nonce автоматически обрабатывается библиотекой ocsp
-	// при использовании ocsp.ParseRequest и ocsp.CreateResponse
-
 	respBytes, err := ocsp.CreateResponse(issuer.Certificate, r.signerCert.Certificate, template, r.signerCert.PrivateKey)
 	if err != nil {
 		logger.Error("[OCSP] ошибка создания ответа: %v", err)
@@ -185,14 +217,16 @@ func (r *OCSPResponder) HandleOCSPRequest(w http.ResponseWriter, req *http.Reque
 	logger.Info("[OCSP] ответ: client=%s, serial=%s, status=%s, time=%v",
 		clientIP, serialHex, status.String(), processingTime)
 
-	auditData := map[string]interface{}{
-		"action":          "ocsp_request",
-		"client_ip":       clientIP,
-		"serial":          serialHex,
-		"status":          status.String(),
-		"processing_time": processingTime.Milliseconds(),
-	}
-	logger.AuditJSON("ocsp_request", auditData)
+	// Аудит
+	logger.LogAuditEvent("ocsp_request", "success",
+		fmt.Sprintf("OCSP request processed: status=%s, serial=%s", status.String(), serialHex),
+		map[string]interface{}{
+			"client_ip":       clientIP,
+			"serial":          serialHex,
+			"status":          status.String(),
+			"processing_time": processingTime.Milliseconds(),
+			"issuer_found":    true,
+		})
 }
 
 func (r *OCSPResponder) getCertStatus(serialHex string) (CertStatus, time.Time, int, error) {
@@ -271,6 +305,13 @@ func (r *OCSPResponder) sendErrorResponse(w http.ResponseWriter, err *OCSPError)
 	w.Header().Set("Content-Type", "application/ocsp-response")
 	w.WriteHeader(http.StatusOK)
 	w.Write(respBytes)
+
+	// Аудит ошибки
+	logger.LogAuditError("ocsp_error", err.Error(),
+		map[string]interface{}{
+			"error_code":    err.Code,
+			"error_message": err.Message,
+		})
 }
 
 func loadPEMFile(path string) ([]byte, error) {
@@ -304,4 +345,9 @@ func reasonStringToCode(reason string) int {
 		return code
 	}
 	return 0
+}
+
+// GetRateLimiter возвращает rate limiter для внешней настройки
+func (r *OCSPResponder) GetRateLimiter() *ratelimit.RateLimiter {
+	return r.rateLimiter
 }

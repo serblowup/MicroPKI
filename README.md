@@ -16,6 +16,13 @@
 - Отзыв сертификатов с поддержкой всех причин RFC 5280
 - Генерация и распространение списков отзыва (CRL)
 - OCSP-ответчик (Online Certificate Status Protocol) для проверки статуса сертификатов в реальном времени
+- Аудит-система с криптографической целостностью (NDJSON + SHA-256 хеш-цепочка)
+- Обнаружение аномалий в аудит-логе
+- Симуляция Certificate Transparency (CT лог)
+- Политики безопасности: размеры ключей, сроки действия, SAN, алгоритмы
+- Ограничение частоты запросов (Rate Limiting)
+- Симуляция компрометации приватных ключей
+- Блокировка скомпрометированных ключей
 - Безопасное хранение ключей с шифрованием (AES-256)
 - Генерация X.509 сертификатов с правильными расширениями
 - Документирование политики сертификации
@@ -111,6 +118,11 @@ make scripts
 | `--log-file` | Файл для логов | stderr |
 | `--force` | Принудительная перезапись | `false` |
 
+**Политики безопасности:**
+- RSA ключ корневого CA должен быть не менее 4096 бит
+- ECC ключ корневого CA должен быть не менее P-384
+- Срок действия корневого CA не более 3650 дней (10 лет)
+
 #### `ca issue-intermediate` - создание промежуточного УЦ
 
 ```bash
@@ -144,6 +156,12 @@ make scripts
 | `--pathlen` | Ограничение длины пути | `0` |
 | `--log-file` | Файл для логов | stderr |
 | `--force` | Принудительная перезапись | `false` |
+
+**Политики безопасности:**
+- RSA ключ промежуточного CA должен быть не менее 3072 бит (рекомендуется 4096)
+- ECC ключ промежуточного CA должен быть не менее P-384
+- Срок действия промежуточного CA не более 1825 дней (5 лет)
+- Path Length Constraint не более 0
 
 #### `ca issue-cert` - выпуск конечного сертификата
 
@@ -214,6 +232,16 @@ make scripts
 | `--log-file` | Файл для логов | stderr |
 | `--force` | Принудительная перезапись | `false` |
 
+**Политики безопасности:**
+- RSA ключ конечного субъекта должен быть не менее 2048 бит
+- ECC ключ конечного субъекта должен быть не менее P-256
+- Срок действия конечного сертификата не более 365 дней (1 год)
+- Wildcard SAN (`*.example.com`) запрещены по умолчанию
+- Server: только DNS и IP SAN
+- Client: DNS, IP, email
+- Code Signing: DNS, URI (email и IP запрещены)
+- SHA-1 запрещен, только SHA-256 и выше
+
 #### `ca issue-ocsp-cert` - выпуск сертификата OCSP-ответчика
 
 ```bash
@@ -248,6 +276,34 @@ make scripts
 - Key Usage: `digitalSignature` (только)
 - Basic Constraints: `CA=FALSE`
 - Приватный ключ сохраняется **незашифрованным** с правами `0600` (требуется для автоматического запуска)
+
+#### `ca compromise` - симуляция компрометации приватного ключа
+
+```bash
+# Симуляция компрометации ключа
+./bin/micropki ca compromise \
+    --cert ./pki/certs/example.com.cert.pem \
+    --reason keyCompromise \
+    --force
+
+# С подтверждением (без --force)
+./bin/micropki ca compromise \
+    --cert ./pki/certs/example.com.cert.pem \
+    --reason keyCompromise
+```
+
+| Параметр | Описание | Значение по умолчанию |
+|----------|----------|----------------------|
+| `--cert` | Путь к сертификату для компрометации (обязательно) | - |
+| `--reason` | Причина: keyCompromise, cACompromise | `keyCompromise` |
+| `--force` | Пропустить подтверждение | `false` |
+| `--db-path` | Путь к SQLite базе данных | `./pki/micropki.db` |
+
+При компрометации происходит:
+1. Немедленный отзыв сертификата с указанной причиной
+2. Добавление публичного ключа в таблицу `compromised_keys`
+3. Создание записи в аудит-логе с высоким уровнем важности
+4. Блокировка повторного использования скомпрометированного ключа
 
 #### `ca revoke` - отзыв сертификата
 
@@ -357,7 +413,197 @@ make scripts
     --leaf ./pki/certs/example.com.cert.pem
 ```
 
-### 3. Клиентские команды (`client`) 
+### 3. Аудит-система (`audit`)
+
+Аудит-система обеспечивает:
+- Запись всех критических операций в NDJSON формате
+- Криптографическую целостность через SHA-256 хеш-цепочку
+- Обнаружение подделки, удаления или изменения записей
+- Фильтрацию и поиск записей
+- Экспорт в table, JSON и CSV форматах
+
+**Расположение файлов аудита:**
+
+```
+./pki/audit/
+├── audit.log    # Аудит-лог в формате NDJSON
+└── chain.dat    # Файл с хешами для проверки целостности
+```
+
+**Формат записи аудит-лога:**
+
+```json
+{
+  "timestamp": "2026-04-26T11:03:29.357117548Z",
+  "level": "AUDIT",
+  "operation": "certificate_issued",
+  "status": "success",
+  "message": "Issued server certificate for CN=example.com",
+  "metadata": {
+    "serial": "be22c9bb05b08eb",
+    "subject": "/CN=example.com",
+    "template": "server"
+  },
+  "integrity": {
+    "prev_hash": "abc123...",
+    "hash": "def456..."
+  }
+}
+```
+
+#### `audit query` - запрос аудит-лога
+
+```bash
+# Показать все записи
+./bin/micropki audit query
+
+# Фильтр по операции
+./bin/micropki audit query --operation issue
+
+# Фильтр по времени
+./bin/micropki audit query --from "2026-04-26T00:00:00Z" --to "2026-04-26T23:59:59Z"
+
+# Фильтр по уровню
+./bin/micropki audit query --level AUDIT
+
+# Фильтр по серийному номеру
+./bin/micropki audit query --serial be22c9bb05b08eb
+
+# Вывод в JSON формате
+./bin/micropki audit query --format json
+
+# Вывод в CSV формате
+./bin/micropki audit query --format csv
+
+# С проверкой целостности найденных записей
+./bin/micropki audit query --verify
+```
+
+| Параметр | Описание | Значение по умолчанию |
+|----------|----------|----------------------|
+| `--from` | Начальная временная метка (ISO 8601) | - |
+| `--to` | Конечная временная метка (ISO 8601) | - |
+| `--level` | Уровень: AUDIT, INFO, WARNING, ERROR | - |
+| `--operation` | Фильтр по типу операции | - |
+| `--serial` | Фильтр по серийному номеру | - |
+| `--format` | Формат вывода: table, json, csv | `table` |
+| `--verify` | Проверить целостность найденных записей | `false` |
+| `--log-file` | Путь к файлу аудит-лога | `./pki/audit/audit.log` |
+
+#### `audit verify` - проверка целостности аудит-лога
+
+```bash
+# Проверка целостности (exit code 0 = целостен, 1 = нарушение)
+./bin/micropki audit verify
+
+# С указанием путей
+./bin/micropki audit verify \
+    --log-file ./pki/audit/audit.log \
+    --chain-file ./pki/audit/chain.dat
+```
+
+| Параметр | Описание | Значение по умолчанию |
+|----------|----------|----------------------|
+| `--log-file` | Путь к файлу аудит-лога | `./pki/audit/audit.log` |
+| `--chain-file` | Путь к файлу цепочки хешей | `./pki/audit/chain.dat` |
+
+**Принцип работы:**
+1. Читаются все записи из audit.log
+2. Для каждой записи проверяется:
+   - `prev_hash` совпадает с хешем предыдущей записи
+   - `hash` совпадает с SHA-256 вычисленным от содержимого записи
+3. При обнаружении несовпадения выводится индекс первой поврежденной записи
+
+#### `audit ct-verify` - проверка Certificate Transparency лога
+
+```bash
+# Проверка по серийному номеру
+./bin/micropki audit ct-verify --serial be22c9bb05b08eb
+
+# Проверка по SHA-256 отпечатку
+./bin/micropki audit ct-verify --fingerprint abc123...
+```
+
+| Параметр | Описание | Значение по умолчанию |
+|----------|----------|----------------------|
+| `--serial` | Серийный номер сертификата | - |
+| `--fingerprint` | SHA-256 отпечаток сертификата | - |
+| `--ct-log` | Путь к CT логу | `./pki/audit/ct.log` |
+
+#### `audit detect-anomalies` - обнаружение аномалий
+
+```bash
+# Поиск аномалий с порогом 50 событий в час
+./bin/micropki audit detect-anomalies --threshold 50
+
+# Поиск аномалий с низким порогом
+./bin/micropki audit detect-anomalies --threshold 10
+```
+
+| Параметр | Описание | Значение по умолчанию |
+|----------|----------|----------------------|
+| `--threshold` | Порог событий в час | `100` |
+| `--log-file` | Путь к файлу аудит-лога | `./pki/audit/audit.log` |
+
+**Обнаруживаемые аномалии:**
+- Высокая частота событий (превышение порога в час)
+- Подозрительно высокая частота отзывов (>30% от всех операций)
+- Обнаружение событий компрометации ключей
+- Высокая частота ошибок
+
+### 4. Certificate Transparency (CT) лог
+
+CT лог автоматически создается при выпуске сертификатов и хранится в `./pki/audit/ct.log`.
+
+```bash
+# Просмотр CT лога
+cat ./pki/audit/ct.log
+
+# Проверка наличия сертификата
+./bin/micropki audit ct-verify --serial be22c9bb05b08eb
+```
+
+**Формат записи CT лога:**
+
+```json
+{
+  "timestamp": "2026-04-26T11:04:00Z",
+  "serial_hex": "0be21020a2c53b85",
+  "subject_dn": "CN=example.com",
+  "sha256_fingerprint": "88760843bb8897a680...",
+  "issuer_dn": "CN=Test Intermediate CA"
+}
+```
+
+### 5. Ограничение частоты запросов (Rate Limiting)
+
+Поддерживается для HTTP репозитория и OCSP-ответчика.
+
+```bash
+# Запуск репозитория с rate limiting (1 запрос/сек, burst 5)
+./bin/micropki repo serve \
+    --host 127.0.0.1 \
+    --port 8080 \
+    --rate-limit 1 \
+    --rate-burst 5
+
+# Запуск OCSP с rate limiting
+./bin/micropki ocsp serve \
+    --responder-cert ./pki/ocsp/ocsp.cert.pem \
+    --responder-key ./pki/ocsp/ocsp.key.pem \
+    --ca-cert ./pki/certs/intermediate.cert.pem \
+    --rate-limit 10 \
+    --rate-burst 20
+```
+
+| Параметр | Описание | Значение по умолчанию |
+|----------|----------|----------------------|
+| `--rate-limit` | Запросов в секунду (0 = отключено) | `0` |
+| `--rate-burst` | Максимальный burst | `10` |
+
+При превышении лимита возвращается HTTP 429 с заголовком `Retry-After`.
+
+### 6. Клиентские команды (`client`) 
 
 #### `client gen-csr` - генерация CSR
 
@@ -462,7 +708,7 @@ make scripts
 #### `client check-status` - проверка статуса отзыва
 
 ```bash
-# Проверка с автоматическим fallback (OCSP → CRL)
+# Проверка с автоматическим fallback (OCSP -> CRL)
 ./bin/micropki client check-status \
     --cert ./app.cert.pem \
     --ca-cert ./pki/certs/intermediate.cert.pem
@@ -489,11 +735,11 @@ make scripts
 | `--log-file` | Файл для логов | stderr |
 
 **Логика проверки отзыва:**
-1. **OCSP первый** - если доступен OCSP URL (из AIA или указан явно)
-2. **Fallback на CRL** - если OCSP недоступен или вернул `unknown`
-3. **Результат** - `good`, `revoked` или `unknown`
+1. OCSP первый - если доступен OCSP URL (из AIA или указан явно)
+2. Fallback на CRL - если OCSP недоступен или вернул `unknown`
+3. Результат - `good`, `revoked` или `unknown`
 
-### 4. OCSP-ответчик (`ocsp`)
+### 7. OCSP-ответчик (`ocsp`)
 
 #### `ocsp serve` - запуск OCSP-ответчика
 
@@ -524,7 +770,7 @@ make scripts
 - `POST /` - OCSP запросы
 - `POST /ocsp` - альтернативный путь
 
-### 5. HTTP репозиторий (`repo`) 
+### 8. HTTP репозиторий (`repo`) 
 
 #### `repo serve` - запуск HTTP сервера
 
@@ -534,6 +780,13 @@ make scripts
 
 # Запуск на всех интерфейсах
 ./bin/micropki repo serve --host 0.0.0.0 --port 8443 --db-path ./pki/micropki.db
+
+# Запуск с rate limiting
+./bin/micropki repo serve \
+    --host 127.0.0.1 \
+    --port 8080 \
+    --rate-limit 5 \
+    --rate-burst 10
 ```
 
 | Параметр | Описание | Значение по умолчанию |
@@ -542,6 +795,8 @@ make scripts
 | `--port` | TCP порт | `8080` |
 | `--db-path` | Путь к SQLite базе данных | `./pki/micropki.db` |
 | `--cert-dir` | Директория с PEM сертификатами | `./pki/certs` |
+| `--rate-limit` | Запросов в секунду (0 = отключено) | `0` |
+| `--rate-burst` | Максимальный burst | `10` |
 | `--log-file` | Файл для логов | stderr |
 
 #### `repo status` - проверка статуса сервера
@@ -550,7 +805,7 @@ make scripts
 ./bin/micropki repo status --host 127.0.0.1 --port 8080
 ```
 
-### 6. API эндпоинты HTTP сервера
+### 9. API эндпоинты HTTP сервера
 
 #### `GET /health` - проверка работоспособности
 
@@ -576,7 +831,7 @@ curl http://127.0.0.1:8080/ca/intermediate -o inter.pem
 curl http://127.0.0.1:8080/certificate/0baee839362091a1 -o cert.pem
 ```
 
-#### `POST /request-cert` - запрос сертификата из CSR 🆕
+#### `POST /request-cert` - запрос сертификата из CSR
 
 ```bash
 # Отправка CSR через API
@@ -624,6 +879,10 @@ curl "http://127.0.0.1:8080/crl?ca=root" -o root.crl.pem
 ```
 ./pki/
 ├── micropki.db                  # SQLite база данных
+├── audit/                       # Аудит-система
+│   ├── audit.log               # Аудит-лог (NDJSON)
+│   ├── chain.dat               # Хеш-цепочка
+│   └── ct.log                   # CT лог
 ├── private/
 │   ├── ca.key.pem               # зашифрованный ключ корневого УЦ (0600)
 │   └── intermediate.key.pem     # зашифрованный ключ промежуточного УЦ (0600)
@@ -726,6 +985,21 @@ SERIAL=$(openssl x509 -in test.cert.pem -serial -noout | cut -d'=' -f2 | tr '[:u
     --cert ./test.cert.pem \
     --ca-cert ./pki/certs/intermediate.cert.pem \
     --crl ./pki/crl/intermediate.crl.pem
+
+# 13. Запрос аудит-лога
+./bin/micropki audit query
+
+# 14. Проверка целостности аудит-лога
+./bin/micropki audit verify
+
+# 15. Симуляция компрометации ключа
+./bin/micropki ca compromise --cert ./test.cert.pem --reason keyCompromise --force
+
+# 16. Проверка CT лога
+./bin/micropki audit ct-verify --serial $SERIAL
+
+# 17. Обнаружение аномалий
+./bin/micropki audit detect-anomalies --threshold 10
 ```
 
 ---
@@ -759,6 +1033,9 @@ make test-ocsp
 
 # Тесты CSR
 make test-csr
+
+# Тесты аудита и безопасности
+make test-audit
 ```
 
 Тесты проверяют:
@@ -788,8 +1065,12 @@ make test-csr
 4. **Парольная фраза**: никогда не попадает в логи (автоматически скрывается)
 5. **Временные данные**: очищаются из памяти после использования
 6. **База данных**: SQLite с правами 0644, чувствительные данные не хранятся
-7. **OpenSSL совместимость**: все сертификаты, CRL и OCSP работают с OpenSSL
-8. **API аутентификация**: поддержка API ключа через заголовок `X-API-Key`
+7. **Аудит-лог**: криптографическая целостность через SHA-256 хеш-цепочку, защита от подделки
+8. **Политики безопасности**: принудительная проверка размеров ключей, сроков действия, типов SAN
+9. **Компрометация ключей**: отслеживание и блокировка скомпрометированных ключей
+10. **Rate limiting**: защита от DoS атак через ограничение частоты запросов
+11. **OpenSSL совместимость**: все сертификаты, CRL и OCSP работают с OpenSSL
+12. **API аутентификация**: поддержка API ключа через заголовок `X-API-Key`
 
 ---
 
@@ -804,8 +1085,10 @@ MicroPKI/
 │       ├── 3 sprint.md
 │       ├── 4 sprint.md
 │       ├── 5 sprint.md
-│       └── 6 sprint.md
+│       ├── 6 sprint.md
+│       └── 7 sprint.md
 ├── .gitignore
+├── micropki.yaml
 ├── micropki
 │   ├── cmd
 │   │   └── micropki
@@ -813,6 +1096,12 @@ MicroPKI/
 │   ├── go.mod
 │   ├── go.sum
 │   ├── internal
+│   │   ├── audit
+│   │   │   ├── anomaly.go
+│   │   │   ├── audit.go
+│   │   │   ├── chain.go
+│   │   │   ├── query.go
+│   │   │   └── verify.go
 │   │   ├── ca
 │   │   │   └── ca.go
 │   │   ├── certs
@@ -824,6 +1113,8 @@ MicroPKI/
 │   │   │   ├── csrgen.go
 │   │   │   ├── logging.go
 │   │   │   └── request.go
+│   │   ├── compromise
+│   │   │   └── compromise.go
 │   │   ├── crl
 │   │   │   ├── crl.go
 │   │   │   └── manager.go
@@ -845,6 +1136,10 @@ MicroPKI/
 │   │   │   ├── responder.go
 │   │   │   ├── signer.go
 │   │   │   └── types.go
+│   │   ├── policy
+│   │   │   └── policy.go
+│   │   ├── ratelimit
+│   │   │   └── ratelimit.go
 │   │   ├── repository
 │   │   │   ├── handlers.go
 │   │   │   ├── middleware.go
@@ -858,6 +1153,8 @@ MicroPKI/
 │   │   │   └── san.go
 │   │   ├── templates
 │   │   │   └── templates.go
+│   │   ├── transparency
+│   │   │   └── transparency.go
 │   │   └── validation
 │   │       ├── chain_builder.go
 │   │       ├── extensions.go
@@ -870,9 +1167,12 @@ MicroPKI/
 │   │   ├── test.sh
 │   │   └── verify-chain.sh
 │   └── tests
+│       ├── audit_integration_test.go
+│       ├── audit_test.go
 │       ├── ca_test.go
 │       ├── chain_test.go
 │       ├── client_test.go
+│       ├── compromise_test.go
 │       ├── crl_test.go
 │       ├── crypto_test.go
 │       ├── csr_test.go
@@ -880,11 +1180,14 @@ MicroPKI/
 │       ├── e2e_test.go
 │       ├── integration_test.go
 │       ├── ocsp_test.go
+│       ├── policy_test.go
+│       ├── ratelimit_test.go
 │       ├── repository_test.go
 │       ├── revocation_integration_test.go
 │       ├── revocation_test.go
 │       ├── san_test.go
 │       ├── templates_test.go
+│       ├── transparency_test.go
 │       └── validation_test.go
 └── README.md
 ```

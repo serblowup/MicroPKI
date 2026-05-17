@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strings"
 	"time"
 
 	"MicroPKI/internal/certs"
@@ -15,8 +16,8 @@ import (
 type TemplateType string
 
 const (
-	ServerTemplate     TemplateType = "server"
-	ClientTemplate     TemplateType = "client"
+	ServerTemplate      TemplateType = "server"
+	ClientTemplate      TemplateType = "client"
 	CodeSigningTemplate TemplateType = "code_signing"
 )
 
@@ -68,6 +69,12 @@ func GetTemplate(templateType TemplateType) (*CertTemplate, error) {
 }
 
 func ValidateSANsForTemplate(template *CertTemplate, sanEntries []san.SANEntry) error {
+	for _, entry := range sanEntries {
+		if san.IsWildcard(entry) {
+			return fmt.Errorf("wildcard сертификаты запрещены (SAN: %s:%s)", entry.Type, entry.Value)
+		}
+	}
+
 	if len(sanEntries) == 0 && len(template.RequiredSANTypes) > 0 {
 		return fmt.Errorf("шаблон %s требует как минимум один SAN типа %v", template.Type, template.RequiredSANTypes)
 	}
@@ -159,6 +166,9 @@ func BuildCertificateTemplate(
 	for _, entry := range sanEntries {
 		switch entry.Type {
 		case "dns":
+			if strings.HasPrefix(entry.Value, "*.") {
+				return nil, fmt.Errorf("wildcard DNS имена запрещены: %s", entry.Value)
+			}
 			template.DNSNames = append(template.DNSNames, entry.Value)
 		case "ip":
 			ip := net.ParseIP(entry.Value)

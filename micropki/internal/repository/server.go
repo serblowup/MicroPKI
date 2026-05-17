@@ -12,26 +12,29 @@ import (
 
 	"MicroPKI/internal/database"
 	"MicroPKI/internal/logger"
+	"MicroPKI/internal/ratelimit"
 )
 
 type Server struct {
-	host       string
-	port       int
-	db         *database.Database
-	certDir    string
-	crlDir     string
-	httpServer *http.Server
-	router     *http.ServeMux
+	host        string
+	port        int
+	db          *database.Database
+	certDir     string
+	crlDir      string
+	httpServer  *http.Server
+	router      *http.ServeMux
+	rateLimiter *ratelimit.RateLimiter
 }
 
-func NewServer(host string, port int, db *database.Database, certDir string, crlDir string) *Server {
+func NewServer(host string, port int, db *database.Database, certDir string, crlDir string, rateLimit float64, rateBurst int) *Server {
 	s := &Server{
-		host:    host,
-		port:    port,
-		db:      db,
-		certDir: certDir,
-		crlDir:  crlDir,
-		router:  http.NewServeMux(),
+		host:        host,
+		port:        port,
+		db:          db,
+		certDir:     certDir,
+		crlDir:      crlDir,
+		router:      http.NewServeMux(),
+		rateLimiter: ratelimit.NewRateLimiter(rateLimit, rateBurst),
 	}
 
 	s.registerRoutes()
@@ -54,9 +57,18 @@ func (s *Server) registerRoutes() {
 func (s *Server) Start() error {
 	addr := fmt.Sprintf("%s:%d", s.host, s.port)
 	
+	var handler http.Handler = s.router
+	handler = s.withCORS(handler)
+	
+	if s.rateLimiter.IsEnabled() {
+		handler = ratelimit.RateLimitMiddleware(s.rateLimiter)(handler)
+		logger.Info("ограничение частоты включено: rate=%.1f/s, burst=%d", 
+			s.rateLimiter.GetRate(), s.rateLimiter.GetBurst())
+	}
+	
 	s.httpServer = &http.Server{
 		Addr:         addr,
-		Handler:      s.withCORS(s.router),
+		Handler:      handler,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  120 * time.Second,
@@ -123,4 +135,9 @@ func (s *Server) CrlDir() string {
 
 func (s *Server) WithCORS(handler http.Handler) http.Handler {
 	return s.withCORS(handler)
+}
+
+// GetRateLimiter возвращает rate limiter
+func (s *Server) GetRateLimiter() *ratelimit.RateLimiter {
+	return s.rateLimiter
 }

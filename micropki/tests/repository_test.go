@@ -52,7 +52,7 @@ func setupRepoTest(t *testing.T) (*database.Database, *repository.Server, func()
 		t.Fatal(err)
 	}
 
-	server := repository.NewServer("127.0.0.1", 8080, db, certDir, crlDir)
+	server := repository.NewServer("127.0.0.1", 8080, db, certDir, crlDir, 0, 10)
 
 	cleanup := func() {
 		server.Stop()

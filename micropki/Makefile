@@ -1,4 +1,4 @@
-.PHONY: build clean test test-short test-integration scripts verify help db-init serve revoke gen-crl check-revoked test-crl test-revocation issue-ocsp-cert ocsp-serve test-ocsp test-ocsp-full test-csr csr request-cert validate check-status
+.PHONY: build clean test test-short test-integration scripts verify help db-init serve revoke gen-crl check-revoked test-crl test-revocation issue-ocsp-cert ocsp-serve test-ocsp test-ocsp-full test-csr csr request-cert validate check-status test-audit audit-query audit-verify audit-ct-verify compromise
 
 BINARY_NAME=micropki
 BIN_DIR=bin
@@ -33,7 +33,6 @@ RESPONDER_CERT?=
 RESPONDER_KEY?=
 CACHE_TTL?=60
 
-# Клиентские переменные
 KEY_TYPE?=rsa
 KEY_SIZE?=2048
 OUT_KEY?=./key.pem
@@ -112,7 +111,7 @@ test-ocsp-full:
 	$(GOTEST) -v ./tests/ -run TestOCSP
 
 test-csr:
-	@echo "Запуск тестов CSR и клиент:"
+	@echo "Запуск тестов CSR и клиента:"
 	@echo ""
 	@echo "Клиентские тесты..."
 	@$(GOTEST) -v ./tests/client_test.go || exit 1
@@ -127,6 +126,50 @@ test-csr:
 	@$(GOTEST) -v ./tests/e2e_test.go || exit 1
 	@echo ""
 	@echo "Все тесты Спринта 6 пройдены!"
+
+test-audit:
+	@echo "Запуск всех тестов аудита..."
+	@echo ""
+	@echo "Тесты аудит-лога"
+	@$(GOTEST) -v ./tests/audit_test.go || exit 1
+	@echo ""
+	@echo "Тесты политик безопасности"
+	@$(GOTEST) -v ./tests/policy_test.go || exit 1
+	@echo ""
+	@echo "Тесты компрометации ключей"
+	@$(GOTEST) -v ./tests/compromise_test.go || exit 1
+	@echo ""
+	@echo "Тесты Certificate Transparency"
+	@$(GOTEST) -v ./tests/transparency_test.go || exit 1
+	@echo ""
+	@echo "Тесты rate limiting"
+	@$(GOTEST) -v ./tests/ratelimit_test.go || exit 1
+	@echo ""
+	@echo "Интеграционный тест безопасности"
+	@$(GOTEST) -v ./tests/audit_integration_test.go || exit 1
+	@echo ""
+	@echo "Все тесты Спринта 7 успешно пройдены!"
+
+audit-query:
+	@echo "Запрос аудит-лога..."
+	./$(BIN_DIR)/$(BINARY_NAME) audit query --log-file ./pki/audit/audit.log
+
+audit-verify:
+	@echo "Проверка целостности аудит-лога..."
+	./$(BIN_DIR)/$(BINARY_NAME) audit verify
+
+audit-ct-verify:
+	@echo "Проверка CT лога..."
+	./$(BIN_DIR)/$(BINARY_NAME) audit ct-verify --serial $(SERIAL)
+
+compromise:
+	@echo "Симуляция компрометации ключа..."
+	@if [ -z "$(CERT)" ]; then \
+		echo "Ошибка: необходимо указать CERT"; \
+		echo "Пример: make compromise CERT=./pki/certs/example.com.cert.pem"; \
+		exit 1; \
+	fi
+	./$(BIN_DIR)/$(BINARY_NAME) ca compromise --cert $(CERT) --reason keyCompromise --force
 
 db-init:
 	@echo "Инициализация базы данных..."
@@ -325,44 +368,58 @@ examples:
 	@echo "       --subject \"/CN=example.com\" \\"
 	@echo "       --san dns:example.com"
 	@echo ""
+	@echo "Аудит и безопасность"
+	@echo ""
+	@echo "5. Запрос аудит-лога:"
+	@echo "   make audit-query"
+	@echo ""
+	@echo "6. Проверка целостности аудит-лога:"
+	@echo "   make audit-verify"
+	@echo ""
+	@echo "7. Проверка CT лога:"
+	@echo "   make audit-ct-verify SERIAL=abc123"
+	@echo ""
+	@echo "8. Симуляция компрометации ключа:"
+	@echo "   make compromise CERT=./pki/certs/example.com.cert.pem"
+	@echo ""
 	@echo "Клиентские команды"
 	@echo ""
-	@echo "5. Генерация CSR:"
+	@echo "9. Генерация CSR:"
 	@echo "   make csr SUBJECT=\"/CN=app.example.com\" SAN=\"dns:app.example.com\""
 	@echo ""
-	@echo "6. Запрос сертификата:"
-	@echo "   make request-cert CSR=./request.csr.pem TEMPLATE=server"
+	@echo "10. Запрос сертификата:"
+	@echo "    make request-cert CSR=./request.csr.pem TEMPLATE=server"
 	@echo ""
-	@echo "7. Валидация цепочки:"
-	@echo "   make validate CERT=./cert.pem UNTRUSTED=./inter.pem TRUSTED=./ca.pem"
+	@echo "11. Валидация цепочки:"
+	@echo "    make validate CERT=./cert.pem UNTRUSTED=./inter.pem TRUSTED=./ca.pem"
 	@echo ""
-	@echo "8. Проверка статуса отзыва:"
-	@echo "   make check-status CERT=./cert.pem CA_CERT=./inter.pem"
+	@echo "12. Проверка статуса отзыва:"
+	@echo "    make check-status CERT=./cert.pem CA_CERT=./inter.pem"
 	@echo ""
 	@echo "Отзыв и CRL"
 	@echo ""
-	@echo "9. Отзыв сертификата:"
-	@echo "   make revoke SERIAL=0baee839362091a1 REASON=keyCompromise"
+	@echo "13. Отзыв сертификата:"
+	@echo "    make revoke SERIAL=0baee839362091a1 REASON=keyCompromise"
 	@echo ""
-	@echo "10. Генерация CRL:"
+	@echo "14. Генерация CRL:"
 	@echo "    make gen-crl CA=intermediate NEXT_UPDATE=14"
 	@echo ""
-	@echo "11. Проверка статуса отзыва (CA):"
+	@echo "15. Проверка статуса отзыва (CA):"
 	@echo "    make check-revoked SERIAL=0baee839362091a1"
 	@echo ""
 	@echo "HTTP Репозиторий"
 	@echo ""
-	@echo "12. Запуск HTTP сервера:"
+	@echo "16. Запуск HTTP сервера:"
 	@echo "    make serve"
 	@echo ""
-	@echo "13. Проверка API:"
+	@echo "17. Проверка API:"
 	@echo "    curl http://127.0.0.1:8080/health"
 	@echo "    curl http://127.0.0.1:8080/ca/root"
 	@echo "    curl -X POST http://127.0.0.1:8080/request-cert -F \"csr=@app.csr.pem\" -F \"template=server\""
 	@echo ""
 	@echo "Тестирование"
 	@echo ""
-	@echo "14. Запуск всех тестов:"
+	@echo "18. Запуск всех тестов:"
 	@echo "    make test"
 
 help:
@@ -381,8 +438,15 @@ help:
 	@echo "  make test-crl       - запуск тестов CRL"
 	@echo "  make test-revocation - запуск тестов отзыва"
 	@echo "  make test-ocsp      - запуск тестов OCSP"
+	@echo "  make test-audit     - запуск всех тестов Sprint 7"
 	@echo "  make verify         - проверка кода (fmt, vet, mod verify)"
 	@echo "  make deps           - установка зависимостей"
+	@echo ""
+	@echo "Аудит и безопасность (Sprint 7):"
+	@echo "  make audit-query     - запрос аудит-лога"
+	@echo "  make audit-verify    - проверка целостности аудит-лога"
+	@echo "  make audit-ct-verify - проверка CT лога"
+	@echo "  make compromise      - симуляция компрометации ключа"
 	@echo ""
 	@echo "Клиентские команды:"
 	@echo "  make csr            - генерация CSR"

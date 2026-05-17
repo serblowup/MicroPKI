@@ -61,6 +61,7 @@ secrets/
 /config.json
 /micropki/config.yaml
 /micropki/micropki.conf
+/micropki.yaml
 
 # Файлы Go workspace
 go.work

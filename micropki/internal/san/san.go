@@ -47,6 +47,9 @@ func ValidateSANEntry(entry SANEntry) error {
 		if entry.Value == "" {
 			return fmt.Errorf("DNS имя не может быть пустым")
 		}
+		if IsWildcard(entry) {
+			return fmt.Errorf("wildcard DNS имена запрещены: %s", entry.Value)
+		}
 	case "ip":
 		if net.ParseIP(entry.Value) == nil {
 			return fmt.Errorf("неверный IP адрес: %s", entry.Value)
@@ -72,4 +75,11 @@ func ValidateSANs(entries []SANEntry) error {
 		}
 	}
 	return nil
+}
+
+func IsWildcard(entry SANEntry) bool {
+	if entry.Type == "dns" && strings.HasPrefix(entry.Value, "*.") {
+		return true
+	}
+	return false
 }

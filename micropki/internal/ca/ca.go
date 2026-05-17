@@ -9,6 +9,7 @@ import (
 	"encoding/asn1"
 	"encoding/pem"
 	"fmt"
+	"math/big"
 	"net"
 	"net/url"
 	"os"
@@ -16,14 +17,30 @@ import (
 	"runtime"
 	"time"
 
+	"MicroPKI/internal/audit"
 	"MicroPKI/internal/certs"
+	"MicroPKI/internal/compromise"
 	"MicroPKI/internal/cryptoutil"
 	"MicroPKI/internal/csr"
 	"MicroPKI/internal/database"
 	"MicroPKI/internal/logger"
+	"MicroPKI/internal/policy"
 	"MicroPKI/internal/san"
 	"MicroPKI/internal/templates"
 )
+
+// CheckAuditIntegrityBeforeOperation проверяет целостность аудит-лога перед критическими операциями
+func CheckAuditIntegrityBeforeOperation(outDir string) error {
+	auditDir := filepath.Join(outDir, "audit")
+	logPath := filepath.Join(auditDir, "audit.log")
+	chainPath := filepath.Join(auditDir, "chain.dat")
+
+	if audit.IsAuditLogTampered(logPath, chainPath) {
+		return fmt.Errorf("ОБНАРУЖЕНО НАРУШЕНИЕ ЦЕЛОСТНОСТИ АУДИТ-ЛОГА. Операция заблокирована. " +
+			"Запустите 'micropki audit verify' для диагностики")
+	}
+	return nil
+}
 
 type RootCA struct {
 	Subject        string
@@ -175,6 +192,13 @@ func (ca *RootCA) Initialize() error {
 	}
 
 	logger.Info("инициализация корневого УЦ завершена успешно")
+	return nil
+}
+
+func (ca *RootCA) GetSerialNumber() *big.Int {
+	if ca.certificate != nil {
+		return ca.certificate.SerialNumber
+	}
 	return nil
 }
 
@@ -365,28 +389,23 @@ func (ica *IntermediateCA) Load() (*x509.Certificate, crypto.Signer, error) {
 	return cert, signer, nil
 }
 
-// IssueCertificateFromCSR выпускает сертификат из CSR (CA-1)
 func (ica *IntermediateCA) IssueCertificateFromCSR(csrData []byte, templateName string, validityDays int) (*x509.Certificate, []byte, error) {
-	// Загружаем CA
 	caCert, caSigner, err := ica.Load()
 	if err != nil {
 		return nil, nil, fmt.Errorf("ошибка загрузки CA: %w", err)
 	}
 
-	// Парсим CSR
 	csrObj, err := csr.ParseCSR(csrData)
 	if err != nil {
 		return nil, nil, fmt.Errorf("ошибка парсинга CSR: %w", err)
 	}
 
-	// Проверяем подпись CSR
 	if err := csrObj.CheckSignature(); err != nil {
 		return nil, nil, fmt.Errorf("неверная подпись CSR: %w", err)
 	}
 
-	// Проверяем, что CSR не запрашивает CA сертификат
 	for _, ext := range csrObj.Extensions {
-		if ext.Id.Equal([]int{2, 5, 29, 19}) { // BasicConstraints
+		if ext.Id.Equal([]int{2, 5, 29, 19}) {
 			var basicConstraints struct {
 				IsCA bool `asn1:"optional"`
 			}
@@ -398,17 +417,52 @@ func (ica *IntermediateCA) IssueCertificateFromCSR(csrData []byte, templateName 
 		}
 	}
 
-	// Получаем шаблон
+	pol := policy.DefaultPolicy()
+
+	if err := pol.ValidatePublicKey(csrObj.PublicKey, policy.EndEntity); err != nil {
+		logger.LogAuditError("policy_violation_key_size", err.Error(),
+			map[string]interface{}{
+				"template": templateName,
+			})
+		return nil, nil, fmt.Errorf("нарушение политики размера ключа: %w", err)
+	}
+
+	if err := pol.ValidateSignatureAlgorithm(csrObj.SignatureAlgorithm); err != nil {
+		logger.LogAuditError("policy_violation_algorithm", err.Error(),
+			map[string]interface{}{
+				"template": templateName,
+			})
+		return nil, nil, fmt.Errorf("нарушение политики алгоритма: %w", err)
+	}
+
+	if err := pol.ValidateValidityPeriod(policy.EndEntity, validityDays); err != nil {
+		logger.LogAuditError("policy_violation_validity", err.Error(),
+			map[string]interface{}{
+				"template": templateName,
+			})
+		return nil, nil, fmt.Errorf("нарушение политики срока действия: %w", err)
+	}
+
+	if ica.DB != nil {
+		if compromised, _ := compromise.IsKeyCompromised(ica.DB, csrObj.PublicKey); compromised {
+			err := fmt.Errorf("публичный ключ скомпрометирован, выпуск сертификата запрещен")
+			logger.LogAuditError("compromised_key_blocked", err.Error(),
+				map[string]interface{}{
+					"template": templateName,
+				})
+			return nil, nil, err
+		}
+	}
+
 	templateType := templates.TemplateType(templateName)
 	tmpl, err := templates.GetTemplate(templateType)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	// Извлекаем SAN из CSR
 	var sanEntries []san.SANEntry
 	for _, ext := range csrObj.Extensions {
-		if ext.Id.Equal([]int{2, 5, 29, 17}) { // Subject Alternative Name
+		if ext.Id.Equal([]int{2, 5, 29, 17}) {
 			sanEntries, err = parseSANExtension(ext.Value)
 			if err != nil {
 				logger.Warn("ошибка парсинга SAN из CSR: %v", err)
@@ -417,24 +471,28 @@ func (ica *IntermediateCA) IssueCertificateFromCSR(csrData []byte, templateName 
 		}
 	}
 
-	// Валидируем SAN для шаблона
+	if err := pol.ValidateSANs(templateType, sanEntries); err != nil {
+		logger.LogAuditError("policy_violation_san", err.Error(),
+			map[string]interface{}{
+				"template": templateName,
+			})
+		return nil, nil, fmt.Errorf("нарушение политики SAN: %w", err)
+	}
+
 	if err := templates.ValidateSANsForTemplate(tmpl, sanEntries); err != nil {
 		return nil, nil, fmt.Errorf("неверные SAN для шаблона %s: %w", templateName, err)
 	}
 
-	// Генерируем серийный номер
 	serialNumber, err := certs.GenerateSerialNumber()
 	if err != nil {
 		return nil, nil, fmt.Errorf("ошибка генерации серийного номера: %w", err)
 	}
 
-	// Вычисляем SKI
 	ski, err := certs.CalculateSKI(csrObj.PublicKey)
 	if err != nil {
 		return nil, nil, fmt.Errorf("ошибка вычисления SKI: %w", err)
 	}
 
-	// Создаем шаблон сертификата
 	certTemplate := &x509.Certificate{
 		SerialNumber: serialNumber,
 		Subject:      csrObj.Subject,
@@ -452,7 +510,6 @@ func (ica *IntermediateCA) IssueCertificateFromCSR(csrData []byte, templateName 
 		AuthorityKeyId: caCert.SubjectKeyId,
 	}
 
-	// Добавляем SAN в сертификат
 	for _, entry := range sanEntries {
 		switch entry.Type {
 		case "dns":
@@ -471,7 +528,6 @@ func (ica *IntermediateCA) IssueCertificateFromCSR(csrData []byte, templateName 
 		}
 	}
 
-	// Подписываем сертификат
 	certDER, err := x509.CreateCertificate(rand.Reader, certTemplate, caCert, csrObj.PublicKey, caSigner)
 	if err != nil {
 		return nil, nil, fmt.Errorf("ошибка создания сертификата: %w", err)
@@ -487,7 +543,6 @@ func (ica *IntermediateCA) IssueCertificateFromCSR(csrData []byte, templateName 
 		Bytes: certDER,
 	})
 
-	// Сохраняем в БД
 	if ica.DB != nil {
 		if err := ica.DB.InsertCertificate(cert, certPEM, "valid"); err != nil {
 			logger.Warn("не удалось сохранить сертификат в БД: %v", err)
@@ -499,7 +554,6 @@ func (ica *IntermediateCA) IssueCertificateFromCSR(csrData []byte, templateName 
 	return cert, certPEM, nil
 }
 
-// parseSANExtension парсит SAN расширение из CSR
 func parseSANExtension(value []byte) ([]san.SANEntry, error) {
 	var rawValues []asn1.RawValue
 	if _, err := asn1.Unmarshal(value, &rawValues); err != nil {
@@ -509,14 +563,14 @@ func parseSANExtension(value []byte) ([]san.SANEntry, error) {
 	var entries []san.SANEntry
 	for _, rv := range rawValues {
 		switch rv.Tag {
-		case 2: // dNSName
+		case 2:
 			entries = append(entries, san.SANEntry{Type: "dns", Value: string(rv.Bytes)})
-		case 7: // iPAddress
+		case 7:
 			ip := net.IP(rv.Bytes)
 			entries = append(entries, san.SANEntry{Type: "ip", Value: ip.String()})
-		case 1: // rfc822Name
+		case 1:
 			entries = append(entries, san.SANEntry{Type: "email", Value: string(rv.Bytes)})
-		case 6: // uniformResourceIdentifier
+		case 6:
 			entries = append(entries, san.SANEntry{Type: "uri", Value: string(rv.Bytes)})
 		}
 	}

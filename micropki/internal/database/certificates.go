@@ -102,19 +102,19 @@ func (d *Database) InsertCertificate(cert *x509.Certificate, certPEM []byte, sta
 		return fmt.Errorf("ошибка коммита транзакции: %w", err)
 	}
 
-	auditData := map[string]interface{}{
-		"action":        "certificate_inserted",
-		"serial_number": strings.ToLower(hex.EncodeToString(cert.SerialNumber.Bytes())),
-		"subject":       cert.Subject.String(),
-		"common_name":   commonName,
-		"issuer":        cert.Issuer.String(),
-		"status":        status,
-		"not_before":    cert.NotBefore.UTC().Format(time.RFC3339),
-		"not_after":     cert.NotAfter.UTC().Format(time.RFC3339),
-		"key_type":      keyType,
-		"key_size":      keySize,
-	}
-	logger.AuditJSON("certificate_inserted", auditData)
+	logger.LogAuditEvent("certificate_inserted", "success",
+		fmt.Sprintf("Certificate inserted: %s", commonName),
+		map[string]interface{}{
+			"serial_number": strings.ToLower(hex.EncodeToString(cert.SerialNumber.Bytes())),
+			"subject":       cert.Subject.String(),
+			"common_name":   commonName,
+			"issuer":        cert.Issuer.String(),
+			"status":        status,
+			"not_before":    cert.NotBefore.UTC().Format(time.RFC3339),
+			"not_after":     cert.NotAfter.UTC().Format(time.RFC3339),
+			"key_type":      keyType,
+			"key_size":      keySize,
+		})
 
 	logger.Info("сертификат успешно вставлен: serial=%x", cert.SerialNumber)
 	return nil
@@ -336,14 +336,14 @@ func (d *Database) UpdateCertificateStatus(serialHex string, status string, reas
 		return fmt.Errorf("сертификат с серийным номером %s не найден", serialHex)
 	}
 
-	auditData := map[string]interface{}{
-		"action":        "certificate_status_updated",
-		"serial_number": serialHex,
-		"new_status":    status,
-		"reason":        reason,
-		"timestamp":     time.Now().UTC().Format(time.RFC3339),
-	}
-	logger.AuditJSON("status_updated", auditData)
+	logger.LogAuditEvent("certificate_status_updated", "success",
+		fmt.Sprintf("Certificate status updated to %s", status),
+		map[string]interface{}{
+			"serial_number": serialHex,
+			"new_status":    status,
+			"reason":        reason,
+			"timestamp":     time.Now().UTC().Format(time.RFC3339),
+		})
 
 	logger.Info("статус сертификата обновлен")
 	return nil
@@ -526,4 +526,100 @@ func getKeyInfo(pubKey interface{}) (string, int) {
 	default:
 		return "unknown", 0
 	}
+}
+
+func (d *Database) InsertCompromisedKey(pubKeyHash, serialHex, reason string) error {
+	logger.Info("добавление скомпрометированного ключа: hash=%s, serial=%s", pubKeyHash, serialHex)
+	
+	query := `
+	INSERT OR REPLACE INTO compromised_keys (public_key_hash, certificate_serial, compromise_date, compromise_reason)
+	VALUES (?, ?, datetime('now'), ?)
+	`
+	
+	_, err := d.DB.Exec(query, pubKeyHash, serialHex, reason)
+	if err != nil {
+		return fmt.Errorf("ошибка вставки скомпрометированного ключа: %w", err)
+	}
+	
+	logger.LogAuditEvent("compromised_key_added", "success",
+		fmt.Sprintf("Compromised key added: %s", serialHex),
+		map[string]interface{}{
+			"public_key_hash": pubKeyHash,
+			"serial":          serialHex,
+			"reason":          reason,
+		})
+	
+	return nil
+}
+
+func (d *Database) IsKeyCompromised(pubKeyHash string) (bool, error) {
+	var count int
+	err := d.DB.QueryRow(
+		"SELECT count(*) FROM compromised_keys WHERE public_key_hash = ?",
+		pubKeyHash,
+	).Scan(&count)
+	
+	if err != nil {
+		return false, fmt.Errorf("ошибка проверки компрометации ключа: %w", err)
+	}
+	
+	return count > 0, nil
+}
+
+func (d *Database) GetCompromisedKeyInfo(serialHex string) (*CompromisedKeyInfo, error) {
+	query := `
+	SELECT public_key_hash, certificate_serial, compromise_date, compromise_reason
+	FROM compromised_keys
+	WHERE certificate_serial = ?
+	`
+	
+	var info CompromisedKeyInfo
+	
+	err := d.DB.QueryRow(query, serialHex).Scan(
+		&info.PublicKeyHash,
+		&info.CertSerial,
+		&info.CompromiseDate,
+		&info.CompromiseReason,
+	)
+	
+	if err != nil {
+		if strings.Contains(err.Error(), "no rows") {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("ошибка получения информации: %w", err)
+	}
+	
+	return &info, nil
+}
+
+type CompromisedKeyInfo struct {
+	PublicKeyHash    string
+	CertSerial       string
+	CompromiseDate   string
+	CompromiseReason string
+}
+
+func (d *Database) ListCompromisedKeys() ([]CompromisedKeyInfo, error) {
+	query := `
+	SELECT public_key_hash, certificate_serial, compromise_date, compromise_reason
+	FROM compromised_keys
+	ORDER BY compromise_date DESC
+	`
+	
+	rows, err := d.DB.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка запроса скомпрометированных ключей: %w", err)
+	}
+	defer rows.Close()
+	
+	var result []CompromisedKeyInfo
+	for rows.Next() {
+		var info CompromisedKeyInfo
+		if err := rows.Scan(&info.PublicKeyHash, &info.CertSerial, &info.CompromiseDate, &info.CompromiseReason); err != nil {
+			continue
+		}
+		result = append(result, info)
+	}
+	
+	return result, nil
 }

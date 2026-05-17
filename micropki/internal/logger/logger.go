@@ -1,13 +1,14 @@
 package logger
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"strings"
 	"time"
+
+	"MicroPKI/internal/audit"
 )
 
 var (
@@ -49,6 +50,10 @@ func Init(logFilePath string, jsonLogPath string) error {
 	return nil
 }
 
+func InitAudit(outDir string) error {
+	return audit.InitAuditLogger(outDir)
+}
+
 func Close() {
 	if logFile != nil {
 		logFile.Close()
@@ -56,6 +61,7 @@ func Close() {
 	if jsonLogFile != nil {
 		jsonLogFile.Close()
 	}
+	audit.CloseGlobalAuditLogger()
 }
 
 func formatMessage(level, msg string) string {
@@ -99,6 +105,17 @@ func Audit(serial, subject, template string) {
 			serial, subject, template, time.Now().UTC().Format(time.RFC3339))
 		infoLogger.Println(formatMessage("INFO", msg))
 	}
+	
+	auditLogger := audit.GetAuditLogger()
+	if auditLogger != nil {
+		auditLogger.LogAudit("certificate_issued", "success",
+			fmt.Sprintf("Issued certificate for %s", subject),
+			map[string]interface{}{
+				"serial":   serial,
+				"subject":  subject,
+				"template": template,
+			})
+	}
 }
 
 type JSONLogEntry struct {
@@ -109,24 +126,33 @@ type JSONLogEntry struct {
 }
 
 func AuditJSON(action string, data map[string]interface{}) {
-	if jsonLogger == nil {
-		return
+	auditLogger := audit.GetAuditLogger()
+	if auditLogger != nil {
+		status := "success"
+		if st, ok := data["status"]; ok {
+			if s, ok := st.(string); ok {
+				status = s
+			}
+		}
+		
+		auditLogger.LogAudit(action, status, 
+			fmt.Sprintf("Action: %s", action),
+			data)
 	}
-	
-	entry := JSONLogEntry{
-		Timestamp: time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
-		Level:     "AUDIT",
-		Message:   action,
-		Data:      data,
+}
+
+func LogAuditEvent(operation, status, message string, metadata map[string]interface{}) {
+	auditLogger := audit.GetAuditLogger()
+	if auditLogger != nil {
+		auditLogger.LogAudit(operation, status, message, metadata)
 	}
-	
-	jsonBytes, err := json.Marshal(entry)
-	if err != nil {
-		Error("ошибка маршалинга JSON лога: %v", err)
-		return
+}
+
+func LogAuditError(operation, message string, metadata map[string]interface{}) {
+	auditLogger := audit.GetAuditLogger()
+	if auditLogger != nil {
+		auditLogger.LogError(operation, "failure", message, metadata)
 	}
-	
-	jsonLogger.Println(string(jsonBytes))
 }
 
 func containsPassphrase(msg string) bool {

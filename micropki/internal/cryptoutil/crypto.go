@@ -33,8 +33,16 @@ func GenerateECCP384Key() (*ecdsa.PrivateKey, error) {
 	return ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
 }
 
+func GenerateECCP256Key() (*ecdsa.PrivateKey, error) {
+	return ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+}
+
 func GenerateEndEntityRSAKey() (*rsa.PrivateKey, error) {
 	return rsa.GenerateKey(rand.Reader, 2048)
+}
+
+func GenerateEndEntityECCKey() (*ecdsa.PrivateKey, error) {
+	return ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 }
 
 func SaveEncryptedRSAPEM(path string, key *rsa.PrivateKey, passphrase []byte) error {

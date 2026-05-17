@@ -127,6 +127,18 @@ CREATE TABLE IF NOT EXISTS crl_metadata (
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_crl_metadata_ca_subject ON crl_metadata(ca_subject);`,
+		5: `-- Миграция Sprint 7: таблица скомпрометированных ключей
+CREATE TABLE IF NOT EXISTS compromised_keys (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    public_key_hash TEXT UNIQUE NOT NULL,
+    certificate_serial TEXT NOT NULL,
+    compromise_date TEXT NOT NULL,
+    compromise_reason TEXT NOT NULL,
+    FOREIGN KEY (certificate_serial) REFERENCES certificates(serial_hex)
+);
+
+CREATE INDEX IF NOT EXISTS idx_compromised_keys_hash ON compromised_keys(public_key_hash);
+CREATE INDEX IF NOT EXISTS idx_compromised_keys_serial ON compromised_keys(certificate_serial);`,
 	}
 }
 
