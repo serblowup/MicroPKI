@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"MicroPKI/internal/logger"
-	"MicroPKI/internal/ratelimit"
 )
 
 func (s *Server) withLogging(next http.HandlerFunc) http.HandlerFunc {
@@ -44,14 +43,6 @@ func (s *Server) withCORS(handler http.Handler) http.Handler {
 
 		handler.ServeHTTP(w, r)
 	})
-}
-
-func (s *Server) withRateLimit(handler http.Handler) http.Handler {
-	if s.rateLimiter == nil || !s.rateLimiter.IsEnabled() {
-		return handler
-	}
-
-	return ratelimit.RateLimitMiddleware(s.rateLimiter)(handler)
 }
 
 type loggingResponseWriter struct {

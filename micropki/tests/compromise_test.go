@@ -6,6 +6,8 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"crypto/ecdsa"
+    "crypto/elliptic"
 	"fmt"
 	"math/big"
 	"os"
@@ -16,6 +18,41 @@ import (
 	"MicroPKI/internal/compromise"
 	"MicroPKI/internal/database"
 )
+
+func createCompromiseTestCert(t *testing.T, key *rsa.PrivateKey) *x509.Certificate {
+	t.Helper()
+
+	serialNumber, _ := rand.Int(rand.Reader, big.NewInt(1<<62))
+	now := time.Now().UTC()
+
+	template := &x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			CommonName: "test.example.com",
+		},
+		Issuer: pkix.Name{
+			CommonName: "Test CA",
+		},
+		NotBefore: now,
+		NotAfter:  now.AddDate(1, 0, 0),
+
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		IsCA:                  false,
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("ошибка создания сертификата: %v", err)
+	}
+
+	cert, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		t.Fatalf("ошибка парсинга сертификата: %v", err)
+	}
+
+	return cert
+}
 
 func TestCompromiseSimulation(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -159,37 +196,113 @@ func TestCompromisedKeyList(t *testing.T) {
 	}
 }
 
-func createCompromiseTestCert(t *testing.T, key *rsa.PrivateKey) *x509.Certificate {
-	t.Helper()
-
-	serialNumber, _ := rand.Int(rand.Reader, big.NewInt(1<<62))
-	now := time.Now().UTC()
-
-	template := &x509.Certificate{
-		SerialNumber: serialNumber,
-		Subject: pkix.Name{
-			CommonName: "test.example.com",
-		},
-		Issuer: pkix.Name{
-			CommonName: "Test CA",
-		},
-		NotBefore: now,
-		NotAfter:  now.AddDate(1, 0, 0),
-
-		KeyUsage:              x509.KeyUsageDigitalSignature,
-		BasicConstraintsValid: true,
-		IsCA:                  false,
-	}
-
-	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+func TestComputePublicKeyHash(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		t.Fatalf("ошибка создания сертификата: %v", err)
+		t.Fatal(err)
 	}
-
-	cert, err := x509.ParseCertificate(certDER)
+	
+	cert := createCompromiseTestCert(t, key)
+	
+	hash, err := compromise.ComputePublicKeyHash(cert)
 	if err != nil {
-		t.Fatalf("ошибка парсинга сертификата: %v", err)
+		t.Fatalf("ComputePublicKeyHash ошибка: %v", err)
+	}
+	if len(hash) != 64 {
+		t.Errorf("хеш должен быть 64 символа, получено %d", len(hash))
+	}
+	t.Logf("хеш публичного ключа: %s", hash)
+}
+
+func TestComputePublicKeyHashFromCSR(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	
+	template := &x509.CertificateRequest{
+		Subject: pkix.Name{CommonName: "test.example.com"},
+	}
+	csrDER, err := x509.CreateCertificateRequest(rand.Reader, template, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	csr, err := x509.ParseCertificateRequest(csrDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	
+	hash, err := compromise.ComputePublicKeyHashFromCSR(csr)
+	if err != nil {
+		t.Fatalf("ComputePublicKeyHashFromCSR ошибка: %v", err)
+	}
+	if len(hash) != 64 {
+		t.Errorf("хеш должен быть 64 символа, получено %d", len(hash))
+	}
+	t.Logf("хеш публичного ключа из CSR: %s", hash)
+}
+
+func TestGetKeyType(t *testing.T) {
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	
+	keyType := compromise.GetKeyType(&rsaKey.PublicKey)
+	if keyType != "rsa" {
+		t.Errorf("ожидался 'rsa', получен '%s'", keyType)
+	}
+	t.Logf("тип ключа: %s", keyType)
+}
+
+func TestSimulateKeyCompromiseWithInvalidCert(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test.db")
+
+	db, err := database.NewDatabase(dbPath)
+	if err != nil {
+		t.Fatalf("ошибка создания БД: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.InitSchema(); err != nil {
+		t.Fatalf("ошибка инициализации схемы: %v", err)
 	}
 
-	return cert
+	// Несуществующий файл сертификата
+	_, err = compromise.SimulateKeyCompromise(db, "/nonexistent/cert.pem", "keyCompromise", true)
+	if err == nil {
+		t.Error("ожидалась ошибка для несуществующего сертификата")
+	}
+}
+
+func TestGetKeyTypeFullCoverage(t *testing.T) {
+    // RSA ключ
+    rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+    if err != nil {
+        t.Fatal(err)
+    }
+    keyType := compromise.GetKeyType(&rsaKey.PublicKey)
+    if keyType != "rsa" {
+        t.Errorf("expected 'rsa', got '%s'", keyType)
+    }
+    t.Logf("RSA key type: %s", keyType)
+
+    // ECC ключ
+    eccKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+    if err != nil {
+        t.Fatal(err)
+    }
+    keyType = compromise.GetKeyType(&eccKey.PublicKey)
+    if keyType != "ecc" {
+        t.Errorf("expected 'ecc', got '%s'", keyType)
+    }
+    t.Logf("ECC key type: %s", keyType)
+
+    // Nil (unknown)
+    keyType = compromise.GetKeyType(nil)
+    if keyType != "unknown" {
+        t.Errorf("expected 'unknown', got '%s'", keyType)
+    }
+    t.Logf("Nil key type: %s", keyType)
 }

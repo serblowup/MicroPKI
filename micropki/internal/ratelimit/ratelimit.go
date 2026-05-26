@@ -12,16 +12,14 @@ import (
 	"MicroPKI/internal/logger"
 )
 
-// TokenBucket реализует алгоритм token bucket для ограничения частоты запросов
 type TokenBucket struct {
-	rate       float64 // токенов в секунду
-	burst      int     // максимальный размер ведра
-	tokens     float64 // текущее количество токенов
+	rate       float64
+	burst      int
+	tokens     float64
 	lastUpdate time.Time
 	mu         sync.Mutex
 }
 
-// NewTokenBucket создает новый token bucket
 func NewTokenBucket(rate float64, burst int) *TokenBucket {
 	return &TokenBucket{
 		rate:       rate,
@@ -31,7 +29,6 @@ func NewTokenBucket(rate float64, burst int) *TokenBucket {
 	}
 }
 
-// Allow проверяет, разрешен ли запрос
 func (tb *TokenBucket) Allow() bool {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
@@ -39,7 +36,6 @@ func (tb *TokenBucket) Allow() bool {
 	now := time.Now()
 	elapsed := now.Sub(tb.lastUpdate).Seconds()
 	
-	// Добавляем токены за прошедшее время
 	tb.tokens += elapsed * tb.rate
 	if tb.tokens > float64(tb.burst) {
 		tb.tokens = float64(tb.burst)
@@ -55,16 +51,16 @@ func (tb *TokenBucket) Allow() bool {
 	return false
 }
 
-// RateLimiter управляет ограничением частоты для множества клиентов
 type RateLimiter struct {
 	mu       sync.Mutex
 	clients  map[string]*TokenBucket
-	rate     float64 // запросов в секунду
+	rate     float64
 	burst    int
 	enabled  bool
+	stopCh   chan struct{}
+	closed   bool
 }
 
-// NewRateLimiter создает новый ограничитель частоты
 func NewRateLimiter(rate float64, burst int) *RateLimiter {
 	enabled := rate > 0
 
@@ -73,9 +69,9 @@ func NewRateLimiter(rate float64, burst int) *RateLimiter {
 		rate:    rate,
 		burst:   burst,
 		enabled: enabled,
+		stopCh:  make(chan struct{}),
 	}
 
-	// Запускаем очистку старых клиентов
 	if enabled {
 		go limiter.cleanupLoop()
 	}
@@ -83,7 +79,6 @@ func NewRateLimiter(rate float64, burst int) *RateLimiter {
 	return limiter
 }
 
-// Allow проверяет, разрешен ли запрос для данного клиента
 func (rl *RateLimiter) Allow(clientIP string) bool {
 	if !rl.enabled {
 		return true
@@ -91,6 +86,10 @@ func (rl *RateLimiter) Allow(clientIP string) bool {
 
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
+
+	if rl.closed {
+		return true
+	}
 
 	bucket, exists := rl.clients[clientIP]
 	if !exists {
@@ -108,43 +107,44 @@ func (rl *RateLimiter) Allow(clientIP string) bool {
 	return allowed
 }
 
-// GetRetryAfter возвращает время в секундах до следующего разрешенного запроса
 func (rl *RateLimiter) GetRetryAfter() int {
+	if rl.rate <= 0 {
+		return 1
+	}
 	return int(1.0 / rl.rate)
 }
 
-// IsEnabled возвращает true, если ограничение включено
 func (rl *RateLimiter) IsEnabled() bool {
 	return rl.enabled
 }
 
-// GetRate возвращает текущую частоту
 func (rl *RateLimiter) GetRate() float64 {
 	return rl.rate
 }
 
-// GetBurst возвращает текущий burst
 func (rl *RateLimiter) GetBurst() int {
 	return rl.burst
 }
 
-// cleanupLoop периодически очищает старых клиентов
 func (rl *RateLimiter) cleanupLoop() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
-
-	for range ticker.C {
-		rl.cleanup()
+	
+	for {
+		select {
+		case <-ticker.C:
+			rl.Cleanup()
+		case <-rl.stopCh:
+			return
+		}
 	}
 }
 
-// cleanup удаляет клиентов, которые не активны более 10 минут
-func (rl *RateLimiter) cleanup() {
+// Cleanup удаляет неактивных клиентов
+func (rl *RateLimiter) Cleanup() {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
-	// Простая очистка: удаляем всех клиентов, у которых полное ведро
-	// (они не делали запросов долгое время)
 	for ip, bucket := range rl.clients {
 		bucket.mu.Lock()
 		if bucket.tokens >= float64(bucket.burst) {
@@ -154,7 +154,19 @@ func (rl *RateLimiter) cleanup() {
 	}
 }
 
-// RateLimitMiddleware создает middleware для ограничения частоты запросов
+// Close останавливает cleanupLoop
+func (rl *RateLimiter) Close() {
+	rl.mu.Lock()
+	if rl.closed {
+		rl.mu.Unlock()
+		return
+	}
+	rl.closed = true
+	rl.mu.Unlock()
+	
+	close(rl.stopCh)
+}
+
 func RateLimitMiddleware(limiter *RateLimiter) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -188,50 +200,22 @@ func RateLimitMiddleware(limiter *RateLimiter) func(http.Handler) http.Handler {
 	}
 }
 
-// getClientIP извлекает IP клиента из запроса
 func getClientIP(r *http.Request) string {
-	// Проверяем X-Forwarded-For
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		ips := splitComma(xff)
+		ips := strings.Split(xff, ",")
 		if len(ips) > 0 {
 			return strings.TrimSpace(ips[0])
 		}
 	}
 	
-	// Проверяем X-Real-IP
 	if xri := r.Header.Get("X-Real-IP"); xri != "" {
 		return xri
 	}
 	
-	// Используем RemoteAddr
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr
 	}
 	
 	return host
-}
-
-func splitComma(s string) []string {
-	var result []string
-	for _, part := range splitString(s, ',') {
-		trimmed := strings.TrimSpace(part)
-		if trimmed != "" {
-			result = append(result, trimmed)
-		}
-	}
-	return result
-}
-
-func splitString(s string, sep byte) []string {
-	var result []string
-	start := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == sep {
-			result = append(result, s[start:i])
-			start = i + 1
-		}
-	}
-	result = append(result, s[start:])
-	return result
 }

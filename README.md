@@ -1,5 +1,11 @@
 # MicroPKI
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Go Report Card](https://goreportcard.com/badge/github.com/serblowup/MicroPKI)](https://goreportcard.com/report/github.com/serblowup/MicroPKI)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/serblowup/MicroPKI)](https://golang.org/)
+[![CI](https://github.com/serblowup/MicroPKI/actions/workflows/test.yml/badge.svg)](https://github.com/serblowup/MicroPKI/actions/workflows/test.yml)
+[![Coverage](https://img.shields.io/badge/coverage-79.3%25-brightgreen)](https://github.com/serblowup/MicroPKI)
+
 Минимальная реализация инфраструктуры открытых ключей (PKI) в рамках курса криптографии.
 
 ## Возможности
@@ -31,6 +37,31 @@
 - Автоматическое сохранение сертификатов в БД при выпуске
 - Просмотр сертификатов в табличном, JSON и CSV форматах
 - HTTP репозиторий для получения сертификатов, CRL и приема CSR по API
+
+## Архитектура проекта
+
+Ниже представлена архитектурная диаграмма MicroPKI, показывающая основные компоненты и их взаимодействие:
+
+![MicroPKI Architecture](docs/architecture.png)
+
+**Описание компонентов:**
+
+| Компонент | Описание |
+|-----------|----------|
+| **CA Module** | Создание и управление корневым и промежуточными УЦ, выпуск сертификатов с поддержкой шаблонов |
+| **Validation Engine** | Построение цепочек сертификатов, валидация путей по RFC 5280, проверка подписей и сроков действия |
+| **Revocation Module** | Управление отзывом сертификатов, генерация CRL, OCSP-ответчик для проверки статуса в реальном времени |
+| **SQLite Database** | Хранение всех выпущенных сертификатов, метаданных CRL и скомпрометированных ключей |
+| **File System** | Хранение зашифрованных ключей УЦ, PEM-сертификатов и CRL-файлов с правами 0600/0700 |
+| **Audit Log** | NDJSON-формат с SHA-256 хеш-цепочкой для защиты от подделки |
+| **Repository Server** | HTTP API для получения сертификатов, распространения CRL и приёма CSR |
+| **OCSP Responder** | Ответчик по протоколу OCSP с кэшированием и ограничением частоты запросов |
+| **Policy Engine** | Принудительная проверка политик: размеры ключей, сроки действия, ограничения SAN |
+| **Rate Limiter** | Алгоритм Token Bucket для защиты от DoS-атак |
+| **CT Logger** | Симуляция Certificate Transparency для аудита |
+| **Compromise Detection** | Отслеживание скомпрометированных ключей и блокировка их повторного использования |
+| **Client Tools** | Утилиты для генерации CSR, запроса сертификатов, валидации цепочек и проверки статуса |
+```
 
 ## Требования
 
@@ -1078,95 +1109,105 @@ make test-audit
 
 ```text
 MicroPKI/
-├── docs
-│   └── sprints
+├── demo/
+│   ├── DEMO.md                   # Документация демонстрации
+│   └── demo.sh                   # Автоматизированный демо-скрипт
+├── docs/
+│   ├── API.md                    # API Reference
+│   ├── USERGUIDE.md              # Руководство пользователя
+│   ├── architecture.png          # Архитектурная диаграмма
+│   └── sprints/                  # Отчёты по спринтам (1-8)
 │       ├── 1 sprint.md
 │       ├── 2 sprint.md
 │       ├── 3 sprint.md
 │       ├── 4 sprint.md
 │       ├── 5 sprint.md
 │       ├── 6 sprint.md
-│       └── 7 sprint.md
+│       ├── 7 sprint.md
+│       └── 8 sprint.md
+├── .github
+│   └── workflows
+│       └── test.yml
 ├── .gitignore
-├── micropki.yaml
+├── LICENSE                       # MIT License
 ├── micropki
 │   ├── cmd
 │   │   └── micropki
-│   │       └── main.go
+│   │       └── main.go           # Точка входа CLI
 │   ├── go.mod
 │   ├── go.sum
 │   ├── internal
-│   │   ├── audit
+│   │   ├── audit/                # Аудит-система (NDJSON + хеш-цепочка)
 │   │   │   ├── anomaly.go
 │   │   │   ├── audit.go
 │   │   │   ├── chain.go
 │   │   │   ├── query.go
 │   │   │   └── verify.go
-│   │   ├── ca
+│   │   ├── ca/                   # Логика работы с УЦ
 │   │   │   └── ca.go
-│   │   ├── certs
+│   │   ├── certs/                # Создание сертификатов
 │   │   │   └── certificate.go
-│   │   ├── chain
+│   │   ├── chain/                # Проверка цепочек
 │   │   │   └── chain.go
-│   │   ├── client
+│   │   ├── client/               # Клиентские операции
 │   │   │   ├── client.go
 │   │   │   ├── csrgen.go
 │   │   │   ├── logging.go
 │   │   │   └── request.go
-│   │   ├── compromise
+│   │   ├── compromise/           # Симуляция компрометации ключей
 │   │   │   └── compromise.go
-│   │   ├── crl
+│   │   ├── crl/                  # Генерация и управление CRL
 │   │   │   ├── crl.go
 │   │   │   └── manager.go
-│   │   ├── cryptoutil
+│   │   ├── cryptoutil/           # Криптографические утилиты
 │   │   │   └── crypto.go
-│   │   ├── csr
+│   │   ├── csr/                  # Генерация и обработка CSR
 │   │   │   └── csr.go
-│   │   ├── database
+│   │   ├── database/             # Работа с SQLite БД
 │   │   │   ├── certificates.go
 │   │   │   ├── db.go
 │   │   │   ├── schema.go
 │   │   │   └── serial.go
-│   │   ├── logger
+│   │   ├── logger/               # Логирование
 │   │   │   └── logger.go
-│   │   ├── ocsp
+│   │   ├── ocsp/                 # OCSP-ответчик
 │   │   │   ├── cache.go
 │   │   │   ├── errors.go
 │   │   │   ├── issuer.go
 │   │   │   ├── responder.go
 │   │   │   ├── signer.go
 │   │   │   └── types.go
-│   │   ├── policy
+│   │   ├── policy/               # Политики безопасности
 │   │   │   └── policy.go
-│   │   ├── ratelimit
+│   │   ├── ratelimit/            # Ограничение частоты запросов
 │   │   │   └── ratelimit.go
-│   │   ├── repository
+│   │   ├── repository/           # HTTP репозиторий
 │   │   │   ├── handlers.go
 │   │   │   ├── middleware.go
 │   │   │   └── server.go
-│   │   ├── revocation
+│   │   ├── revocation/           # Проверка отзыва (CRL/OCSP)
 │   │   │   ├── crl_checker.go
 │   │   │   ├── fallback.go
 │   │   │   ├── ocsp_checker.go
 │   │   │   └── revocation.go
-│   │   ├── san
+│   │   ├── san/                  # Парсинг и валидация SAN
 │   │   │   └── san.go
-│   │   ├── templates
+│   │   ├── templates/            # Шаблоны сертификатов
 │   │   │   └── templates.go
-│   │   ├── transparency
+│   │   ├── transparency/         # Certificate Transparency лог
 │   │   │   └── transparency.go
-│   │   └── validation
+│   │   └── validation/           # Валидация цепочек сертификатов
 │   │       ├── chain_builder.go
 │   │       ├── extensions.go
 │   │       ├── path_validator.go
 │   │       ├── result.go
 │   │       └── validator.go
-│   ├── Makefile
-│   ├── scripts
+│   ├── Makefile                  # Сборка, тесты, утилиты
+│   ├── scripts/                  # Вспомогательные скрипты
 │   │   ├── test-revocation-with-openssl.sh
 │   │   ├── test.sh
 │   │   └── verify-chain.sh
-│   └── tests
+│   └── tests/                    # Модульные и интеграционные тесты
 │       ├── audit_integration_test.go
 │       ├── audit_test.go
 │       ├── ca_test.go
@@ -1178,8 +1219,11 @@ MicroPKI/
 │       ├── csr_test.go
 │       ├── database_test.go
 │       ├── e2e_test.go
+│       ├── integration_full_test.go
 │       ├── integration_test.go
+│       ├── logger_test.go
 │       ├── ocsp_test.go
+│       ├── perf_test.go
 │       ├── policy_test.go
 │       ├── ratelimit_test.go
 │       ├── repository_test.go
@@ -1189,5 +1233,22 @@ MicroPKI/
 │       ├── templates_test.go
 │       ├── transparency_test.go
 │       └── validation_test.go
+├── micropki.yaml                 # Конфигурация политик безопасности
 └── README.md
 ```
+
+
+### Покрытие кода
+
+```bash
+# Запуск тестов с отчётом о покрытии
+go test -coverprofile=coverage.out ./tests/... -coverpkg=./internal/... -timeout 300s
+
+# Просмотр общего покрытия
+go tool cover -func=coverage.out | grep total
+
+# Просмотр покрытия в HTML
+go tool cover -html=coverage.out
+```
+
+**Текущее покрытие:** **79.3%**

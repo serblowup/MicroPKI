@@ -60,7 +60,7 @@ func LoadOCSPResponderCert(certPath, keyPath string) (*OCSPResponderCert, error)
 		return nil, fmt.Errorf("ключ не поддерживает подписание")
 	}
 
-	if err := validateOCSPResponderCert(cert); err != nil {
+	if err := ValidateOCSPResponderCert(cert); err != nil {
 		return nil, err
 	}
 
@@ -71,7 +71,7 @@ func LoadOCSPResponderCert(certPath, keyPath string) (*OCSPResponderCert, error)
 	}, nil
 }
 
-func validateOCSPResponderCert(cert *x509.Certificate) error {
+func ValidateOCSPResponderCert(cert *x509.Certificate) error {
 	if cert.KeyUsage&x509.KeyUsageDigitalSignature == 0 {
 		return fmt.Errorf("сертификат OCSP-ответчика должен иметь KeyUsage digitalSignature")
 	}

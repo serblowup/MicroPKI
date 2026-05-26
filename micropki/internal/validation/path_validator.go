@@ -105,7 +105,7 @@ func (pv *PathValidator) ValidatePath(path []*x509.Certificate) (*ValidationResu
         })
         
         // Проверка Basic Constraints
-        if err := pv.validateBasicConstraints(cert, issuer, i == len(path)-2); err != nil {
+        if err := pv.ValidateBasicConstraints(cert, issuer, i == len(path)-2); err != nil {
             result.Valid = false
             result.Error = err.Error()
             result.Steps = append(result.Steps, ValidationStep{
@@ -144,21 +144,22 @@ func (pv *PathValidator) ValidatePath(path []*x509.Certificate) (*ValidationResu
     return result, nil
 }
 
-func (pv *PathValidator) validateBasicConstraints(cert, issuer *x509.Certificate, isLastCA bool) error {
-    // Для конечного сертификата
-    if !isLastCA && cert.IsCA {
-        return fmt.Errorf("конечный сертификат не должен быть CA")
-    }
-    
-    // Для промежуточных CA
-    if cert.IsCA && !isLastCA {
-        // Проверяем pathLenConstraint
-        if cert.MaxPathLenZero && !isLastCA {
-            return fmt.Errorf("pathLenConstraint=0, но сертификат используется для выпуска других сертификатов")
-        }
-    }
-    
-    return nil
+// ValidateBasicConstraints проверяет Basic Constraints
+func (pv *PathValidator) ValidateBasicConstraints(cert, issuer *x509.Certificate, isLastCA bool) error {
+	// Для конечного сертификата
+	if !isLastCA && cert.IsCA {
+		return fmt.Errorf("конечный сертификат не должен быть CA")
+	}
+	
+	// Для промежуточных CA
+	if cert.IsCA && !isLastCA {
+		// Проверяем pathLenConstraint
+		if cert.MaxPathLenZero && !isLastCA {
+			return fmt.Errorf("pathLenConstraint=0, но сертификат используется для выпуска других сертификатов")
+		}
+	}
+	
+	return nil
 }
 
 func (pv *PathValidator) validateKeyUsage(cert, issuer *x509.Certificate) error {

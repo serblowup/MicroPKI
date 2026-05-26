@@ -351,3 +351,14 @@ func reasonStringToCode(reason string) int {
 func (r *OCSPResponder) GetRateLimiter() *ratelimit.RateLimiter {
 	return r.rateLimiter
 }
+
+// Close останавливает OCSP responder и освобождает ресурсы
+func (r *OCSPResponder) Close() error {
+	if r.cache != nil {
+		r.cache.Close()
+	}
+	if r.rateLimiter != nil {
+		r.rateLimiter.Close()
+	}
+	return nil
+}

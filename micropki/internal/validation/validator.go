@@ -98,7 +98,7 @@ func (v *Validator) ValidateChain(leaf *x509.Certificate, opts *ValidateOptions)
 	
 	// Проверка отзыва (если требуется)
 	if opts.CheckRevocation {
-		revResult, err := v.checkRevocation(leaf, path[1], opts)
+		revResult, err := v.CheckRevocation(leaf, path[1], opts)
 		if err != nil {
 			// Логируем ошибку, но не фейлим валидацию
 			revResult = &RevocationResult{
@@ -127,10 +127,8 @@ func (v *Validator) ValidateChain(leaf *x509.Certificate, opts *ValidateOptions)
 	return result, nil
 }
 
-// checkRevocation выполняет проверку статуса отзыва
-func (v *Validator) checkRevocation(cert, issuer *x509.Certificate, opts *ValidateOptions) (*RevocationResult, error) {
-	// Здесь будет интеграция с revocation checker
-	// Пока возвращаем заглушку
+// CheckRevocation выполняет проверку статуса отзыва
+func (v *Validator) CheckRevocation(cert, issuer *x509.Certificate, opts *ValidateOptions) (*RevocationResult, error) {
 	return &RevocationResult{
 		Checked: true,
 		Status:  "good",

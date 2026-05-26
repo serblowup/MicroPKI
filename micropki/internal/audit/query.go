@@ -55,7 +55,7 @@ func matchesFilters(entry *AuditEntry, filters *AuditFilters) bool {
 		entryTime, err := time.Parse(time.RFC3339Nano, entry.Timestamp)
 		if err != nil {
 			// Пробуем другие форматы
-			entryTime, err = parseFlexibleTime(entry.Timestamp)
+			entryTime, err = ParseFlexibleTime(entry.Timestamp)
 			if err != nil {
 				return false
 			}
@@ -69,7 +69,7 @@ func matchesFilters(entry *AuditEntry, filters *AuditFilters) bool {
 	if !filters.To.IsZero() {
 		entryTime, err := time.Parse(time.RFC3339Nano, entry.Timestamp)
 		if err != nil {
-			entryTime, err = parseFlexibleTime(entry.Timestamp)
+			entryTime, err = ParseFlexibleTime(entry.Timestamp)
 			if err != nil {
 				return false
 			}
@@ -109,8 +109,8 @@ func matchesFilters(entry *AuditEntry, filters *AuditFilters) bool {
 	return true
 }
 
-// parseFlexibleTime парсит время в разных форматах
-func parseFlexibleTime(s string) (time.Time, error) {
+// ParseFlexibleTime парсит время в разных форматах
+func ParseFlexibleTime(s string) (time.Time, error) {
 	formats := []string{
 		time.RFC3339Nano,
 		time.RFC3339,

@@ -49,6 +49,8 @@ OCSP?=false
 MODE?=full
 OCSP_URL?=
 
+PROJECT_ROOT := $(shell pwd)
+
 build:
 	@echo "Сборка $(BINARY_NAME)..."
 	@mkdir -p $(BIN_DIR)
@@ -479,3 +481,7 @@ help:
 	@echo "  make scripts        - запуск всех исполняемых скриптов"
 	@echo "  make examples       - показать примеры использования"
 	@echo "  make help           - показать эту справку"
+
+demo-run:
+	@echo "Запуск демонстрации MicroPKI ..."
+	@cd $(PROJECT_ROOT)/../demo && ./demo.sh

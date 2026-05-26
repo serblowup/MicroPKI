@@ -2,6 +2,7 @@ package database
 
 import (
 	"crypto/rand"
+	"database/sql"
 	"encoding/binary"
 	"fmt"
 	"math/big"
@@ -45,23 +46,36 @@ func (sg *SerialGenerator) GenerateSerialNumber() (*big.Int, error) {
 func (sg *SerialGenerator) GenerateSerialNumberWithCounter() (*big.Int, error) {
 	logger.Info("генерация серийного номера с использованием счетчика")
 
+	// SQLite не поддерживает FOR UPDATE, используем обычную транзакцию
 	tx, err := sg.db.BeginTx()
 	if err != nil {
 		return nil, fmt.Errorf("ошибка начала транзакции: %w", err)
 	}
 	defer tx.Rollback()
 
+	// Пытаемся получить текущий счетчик
 	var counter int64
-	var lastUpdated string
 	err = tx.QueryRow(
-		"SELECT counter_value, last_updated FROM serial_counters WHERE counter_name = 'serial_counter' FOR UPDATE",
-	).Scan(&counter, &lastUpdated)
-	if err != nil {
+		"SELECT counter_value FROM serial_counters WHERE counter_name = 'serial_counter'",
+	).Scan(&counter)
+
+	if err == sql.ErrNoRows {
+		// Если записи нет, создаём
+		counter = 0
+		_, err = tx.Exec(
+			"INSERT INTO serial_counters (counter_name, counter_value, last_updated) VALUES ('serial_counter', 0, datetime('now'))",
+		)
+		if err != nil {
+			return nil, fmt.Errorf("ошибка создания счетчика: %w", err)
+		}
+	} else if err != nil {
 		return nil, fmt.Errorf("ошибка чтения счетчика: %w", err)
 	}
 
+	// Увеличиваем счетчик
 	counter++
 
+	// Обновляем
 	_, err = tx.Exec(
 		"UPDATE serial_counters SET counter_value = ?, last_updated = datetime('now') WHERE counter_name = 'serial_counter'",
 		counter,
@@ -70,6 +84,7 @@ func (sg *SerialGenerator) GenerateSerialNumberWithCounter() (*big.Int, error) {
 		return nil, fmt.Errorf("ошибка обновления счетчика: %w", err)
 	}
 
+	// Генерируем случайную часть
 	randomBytes := make([]byte, 4)
 	_, err = rand.Read(randomBytes)
 	if err != nil {
@@ -77,6 +92,7 @@ func (sg *SerialGenerator) GenerateSerialNumberWithCounter() (*big.Int, error) {
 	}
 	randomPart := binary.BigEndian.Uint32(randomBytes)
 
+	// 64-битный серийный номер: старшие 32 бита = counter, младшие 32 бита = random
 	serialUint64 := (uint64(counter) << 32) | uint64(randomPart)
 
 	if err := tx.Commit(); err != nil {

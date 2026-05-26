@@ -407,7 +407,7 @@ func (s *Server) issueCertificateFromCSR(csrData []byte, templateName, clientIP 
 	var sanEntries []san.SANEntry
 	for _, ext := range csrObj.Extensions {
 		if ext.Id.Equal([]int{2, 5, 29, 17}) { // Subject Alternative Name
-			sanEntries, err = parseSANExtension(ext.Value)
+			sanEntries, err = ParseSANExtension(ext.Value)
 			if err != nil {
 				logger.Warn("[HTTP] ошибка парсинга SAN из CSR: %v", err)
 			}
@@ -517,31 +517,6 @@ func (s *Server) issueCertificateFromCSR(csrData []byte, templateName, clientIP 
 	return certPEM, nil
 }
 
-// parseSANExtension парсит SAN расширение из CSR
-func parseSANExtension(value []byte) ([]san.SANEntry, error) {
-	var rawValues []asn1.RawValue
-	if _, err := asn1.Unmarshal(value, &rawValues); err != nil {
-		return nil, err
-	}
-
-	var entries []san.SANEntry
-	for _, rv := range rawValues {
-		switch rv.Tag {
-		case 2: // dNSName
-			entries = append(entries, san.SANEntry{Type: "dns", Value: string(rv.Bytes)})
-		case 7: // iPAddress
-			ip := net.IP(rv.Bytes)
-			entries = append(entries, san.SANEntry{Type: "ip", Value: ip.String()})
-		case 1: // rfc822Name
-			entries = append(entries, san.SANEntry{Type: "email", Value: string(rv.Bytes)})
-		case 6: // uniformResourceIdentifier
-			entries = append(entries, san.SANEntry{Type: "uri", Value: string(rv.Bytes)})
-		}
-	}
-
-	return entries, nil
-}
-
 func (s *Server) serveCRLFile(w http.ResponseWriter, crlPath string) {
 	data, err := os.ReadFile(crlPath)
 	if err != nil {
@@ -627,4 +602,29 @@ func (s *Server) serveCAFile(w http.ResponseWriter, path string, filename string
 
 	logger.Info("[HTTP] CA сертификат отправлен: %s", path)
 	return true
+}
+
+// ParseSANExtension парсит SAN расширение из CSR
+func ParseSANExtension(value []byte) ([]san.SANEntry, error) {
+	var rawValues []asn1.RawValue
+	if _, err := asn1.Unmarshal(value, &rawValues); err != nil {
+		return nil, err
+	}
+
+	var entries []san.SANEntry
+	for _, rv := range rawValues {
+		switch rv.Tag {
+		case 2: // dNSName
+			entries = append(entries, san.SANEntry{Type: "dns", Value: string(rv.Bytes)})
+		case 7: // iPAddress
+			ip := net.IP(rv.Bytes)
+			entries = append(entries, san.SANEntry{Type: "ip", Value: ip.String()})
+		case 1: // rfc822Name
+			entries = append(entries, san.SANEntry{Type: "email", Value: string(rv.Bytes)})
+		case 6: // uniformResourceIdentifier
+			entries = append(entries, san.SANEntry{Type: "uri", Value: string(rv.Bytes)})
+		}
+	}
+
+	return entries, nil
 }

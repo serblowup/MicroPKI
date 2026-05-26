@@ -25,16 +25,16 @@ func TestParseSANString(t *testing.T) {
 			entry, err := san.ParseSANString(tt.input)
 			if tt.wantErr {
 				if err == nil {
-					t.Error("ожидалась ошибка, но ее не было")
+					t.Error("expected error, got nil")
 				}
 				return
 			}
 			if err != nil {
-				t.Errorf("неожиданная ошибка: %v", err)
+				t.Errorf("unexpected error: %v", err)
 				return
 			}
 			if entry.Type != tt.expected.Type || entry.Value != tt.expected.Value {
-				t.Errorf("ожидалось %+v, получено %+v", tt.expected, entry)
+				t.Errorf("expected %+v, got %+v", tt.expected, entry)
 			}
 		})
 	}
@@ -53,7 +53,7 @@ func TestParseSANs(t *testing.T) {
 	}
 
 	if len(entries) != 3 {
-		t.Errorf("ожидалось 3 записи, получено %d", len(entries))
+		t.Errorf("expected 3 entries, got %d", len(entries))
 	}
 }
 
@@ -77,11 +77,60 @@ func TestValidateSANEntry(t *testing.T) {
 		t.Run(tt.entry.Type+":"+tt.entry.Value, func(t *testing.T) {
 			err := san.ValidateSANEntry(tt.entry)
 			if tt.wantErr && err == nil {
-				t.Error("ожидалась ошибка, но ее не было")
+				t.Error("expected error, got nil")
 			}
 			if !tt.wantErr && err != nil {
-				t.Errorf("неожиданная ошибка: %v", err)
+				t.Errorf("unexpected error: %v", err)
 			}
 		})
+	}
+}
+
+func TestValidateSANs(t *testing.T) {
+	validEntries := []san.SANEntry{
+		{Type: "dns", Value: "example.com"},
+		{Type: "ip", Value: "192.168.1.1"},
+		{Type: "email", Value: "test@example.com"},
+		{Type: "uri", Value: "https://example.com"},
+	}
+
+	err := san.ValidateSANs(validEntries)
+	if err != nil {
+		t.Errorf("ValidateSANs should pass for valid entries: %v", err)
+	}
+
+	invalidEntries := []san.SANEntry{
+		{Type: "dns", Value: ""},
+		{Type: "ip", Value: "invalid"},
+		{Type: "email", Value: "invalid"},
+		{Type: "uri", Value: "://invalid"},
+	}
+
+	err = san.ValidateSANs(invalidEntries)
+	if err == nil {
+		t.Error("ValidateSANs should fail for invalid entries")
+	} else {
+		t.Logf("Correctly rejected invalid entries: %v", err)
+	}
+}
+
+func TestIsWildcard(t *testing.T) {
+	tests := []struct {
+		entry    san.SANEntry
+		expected bool
+	}{
+		{san.SANEntry{Type: "dns", Value: "*.example.com"}, true},
+		{san.SANEntry{Type: "dns", Value: "*.sub.example.com"}, true},
+		{san.SANEntry{Type: "dns", Value: "example.com"}, false},
+		{san.SANEntry{Type: "dns", Value: "*"}, false},
+		{san.SANEntry{Type: "ip", Value: "*.1.1.1"}, false},
+		{san.SANEntry{Type: "email", Value: "*@example.com"}, false},
+	}
+
+	for _, tt := range tests {
+		result := san.IsWildcard(tt.entry)
+		if result != tt.expected {
+			t.Errorf("IsWildcard(%+v) = %v, expected %v", tt.entry, result, tt.expected)
+		}
 	}
 }

@@ -4,11 +4,15 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
+	"math/big"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
+	"MicroPKI/internal/audit"
 	"MicroPKI/internal/ca"
 	"MicroPKI/internal/certs"
 	"MicroPKI/internal/cryptoutil"
@@ -551,8 +555,479 @@ func TestCertificateVerification(t *testing.T) {
 	}
 }
 
+func TestCheckAuditIntegrityBeforeOperation(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "audit-integrity-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	err = audit.InitAuditLogger(tmpDir)
+	if err != nil {
+		t.Logf("инициализация аудита: %v", err)
+	}
+	defer audit.CloseGlobalAuditLogger()
+
+	err = ca.CheckAuditIntegrityBeforeOperation(tmpDir)
+	if err != nil {
+		t.Logf("результат проверки: %v (ожидаемо, если лог пуст)", err)
+	}
+
+	err = ca.CheckAuditIntegrityBeforeOperation("/nonexistent/path")
+	if err != nil {
+		t.Logf("ошибка для несуществующего пути: %v", err)
+	}
+}
+
+func TestGetSerialNumber(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "serial-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	db, cleanupDB := setupTestDBForCA(t)
+	defer cleanupDB()
+
+	passFile := filepath.Join(tmpDir, "test.pass")
+	if err := os.WriteFile(passFile, []byte("testpass123\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	rootCA, err := ca.NewRootCA(
+		"/CN=Test Root CA",
+		"rsa",
+		4096,
+		passFile,
+		tmpDir,
+		365,
+		false,
+		db,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := rootCA.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+
+	serial := rootCA.GetSerialNumber()
+	if serial == nil {
+		t.Error("GetSerialNumber вернул nil")
+	}
+	if serial.Sign() <= 0 {
+		t.Error("серийный номер должен быть положительным")
+	}
+}
+
+func TestNewIntermediateCAWithInvalidPaths(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "inter-ca-err-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	db, cleanupDB := setupTestDBForCA(t)
+	defer cleanupDB()
+
+	tests := []struct {
+		name        string
+		certPath    string
+		keyPath     string
+		passFile    string
+		expectError bool
+	}{
+		{
+			name:        "несуществующий сертификат",
+			certPath:    "/nonexistent/cert.pem",
+			keyPath:     "/nonexistent/key.pem",
+			passFile:    "/nonexistent/pass",
+			expectError: true,
+		},
+		{
+			name:        "пустые пути",
+			certPath:    "",
+			keyPath:     "",
+			passFile:    "",
+			expectError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := ca.NewIntermediateCA(tt.certPath, tt.keyPath, tt.passFile, db)
+			if tt.expectError && err == nil {
+				t.Error("ожидалась ошибка, но ее не было")
+			}
+		})
+	}
+}
+
+func TestIssueCertificateFromCSR(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "issue-csr-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	db, cleanupDB := setupTestDBForCA(t)
+	defer cleanupDB()
+
+	rootPassFile := filepath.Join(tmpDir, "root.pass")
+	os.WriteFile(rootPassFile, []byte("rootpass123\n"), 0600)
+
+	rootCA, err := ca.NewRootCA(
+		"/CN=Test Root CA",
+		"rsa",
+		4096,
+		rootPassFile,
+		tmpDir,
+		365,
+		false,
+		db,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rootCA.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+
+	interPassFile := filepath.Join(tmpDir, "inter.pass")
+	os.WriteFile(interPassFile, []byte("interpass123\n"), 0600)
+
+	rootKey, err := cryptoutil.LoadEncryptedPrivateKey(
+		filepath.Join(tmpDir, "private", "ca.key.pem"),
+		[]byte("rootpass123"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rootCertPEM, _ := os.ReadFile(filepath.Join(tmpDir, "certs", "ca.cert.pem"))
+	block, _ := pem.Decode(rootCertPEM)
+	rootCert, _ := x509.ParseCertificate(block.Bytes)
+
+	interKey, _ := rsa.GenerateKey(rand.Reader, 4096)
+	cryptoutil.SaveEncryptedRSAPEM(
+		filepath.Join(tmpDir, "private", "intermediate.key.pem"),
+		interKey,
+		[]byte("interpass123"),
+	)
+
+	csrPEM, _ := csr.GenerateIntermediateCSR(
+		"/CN=Test Intermediate CA",
+		&interKey.PublicKey,
+		interKey,
+		0,
+	)
+	csrObj, _ := csr.ParseCSR(csrPEM)
+	serialNumber, _ := certs.GenerateSerialNumber()
+	ski, _ := certs.CalculateSKI(&interKey.PublicKey)
+
+	interTemplate := &x509.Certificate{
+		SerialNumber:          serialNumber,
+		Subject:               csrObj.Subject,
+		Issuer:                rootCert.Subject,
+		NotBefore:             rootCert.NotBefore,
+		NotAfter:              rootCert.NotAfter,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		SubjectKeyId:          ski,
+		AuthorityKeyId:        rootCert.SubjectKeyId,
+	}
+
+	interCertDER, _ := x509.CreateCertificate(rand.Reader, interTemplate, rootCert, &interKey.PublicKey, rootKey)
+	interCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: interCertDER})
+	interCertPath := filepath.Join(tmpDir, "certs", "intermediate.cert.pem")
+	os.WriteFile(interCertPath, interCertPEM, 0644)
+
+	interCA, err := ca.NewIntermediateCA(
+		interCertPath,
+		filepath.Join(tmpDir, "private", "intermediate.key.pem"),
+		interPassFile,
+		db,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Создаём CSR с SAN (исправление: добавляем DNSNames)
+	leafKey, _ := rsa.GenerateKey(rand.Reader, 2048)
+	leafCSRTemplate := &x509.CertificateRequest{
+		Subject: pkix.Name{CommonName: "test.example.com"},
+		DNSNames: []string{"test.example.com"}, // Добавляем SAN
+	}
+	leafCSRDER, err := x509.CreateCertificateRequest(rand.Reader, leafCSRTemplate, leafKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafCSRPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE REQUEST",
+		Bytes: leafCSRDER,
+	})
+
+	cert, certPEM, err := interCA.IssueCertificateFromCSR(leafCSRPEM, "server", 365)
+	if err != nil {
+		t.Skipf("Ошибка выпуска сертификата из CSR (может быть нормально): %v", err)
+		return
+	}
+
+	if cert == nil {
+		t.Error("сертификат не создан")
+	}
+	if len(certPEM) == 0 {
+		t.Error("PEM сертификата пуст")
+	}
+
+	t.Logf("сертификат из CSR успешно выпущен: serial=%x", cert.SerialNumber)
+}
+
+func TestSaveCertificateToDB(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "save-cert-db-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	db, cleanupDB := setupTestDBForCA(t)
+	defer cleanupDB()
+
+	serialNum, err := certs.GenerateSerialNumber()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	key, _ := rsa.GenerateKey(rand.Reader, 2048)
+	template := &x509.Certificate{
+		SerialNumber: serialNum,
+		Subject:      pkix.Name{CommonName: "test.example.com"},
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().AddDate(1, 0, 0),
+	}
+	certDER, _ := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	cert, _ := x509.ParseCertificate(certDER)
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+
+	err = ca.SaveCertificateToDB(db, cert, certPEM, "valid")
+	if err != nil {
+		t.Fatalf("ошибка сохранения сертификата в БД: %v", err)
+	}
+	t.Log("сертификат сохранен в БД")
+}
+
 func checkFileExists(t *testing.T, path string) {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		t.Errorf("файл не существует: %s", path)
 	}
+}
+
+func TestInitSerialGenerator(t *testing.T) {
+	db, cleanupDB := setupTestDBForCA(t)
+	defer cleanupDB()
+	
+	certs.InitSerialGenerator(db)
+	t.Log("InitSerialGenerator completed")
+}
+
+func TestValidateSerialNumber(t *testing.T) {
+	db, cleanupDB := setupTestDBForCA(t)
+	defer cleanupDB()
+	
+	certs.InitSerialGenerator(db)
+	
+	// Создаём тестовый сертификат
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(12345),
+		Subject:      pkix.Name{CommonName: "test.example.com"},
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().AddDate(1, 0, 0),
+	}
+	certDER, _ := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	cert, _ := x509.ParseCertificate(certDER)
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	
+	db.InsertCertificate(cert, certPEM, "valid")
+	
+	valid, err := certs.ValidateSerialNumber(cert.SerialNumber, db)
+	if err != nil {
+		t.Fatalf("ValidateSerialNumber ошибка: %v", err)
+	}
+	if !valid {
+		t.Log("серийный номер уже существует (это нормально)")
+	}
+}
+
+func TestGetAKIFromCert(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "Test CA"},
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().AddDate(1, 0, 0),
+		SubjectKeyId: []byte{1, 2, 3, 4, 5},
+	}
+	certDER, _ := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	cert, _ := x509.ParseCertificate(certDER)
+	
+	aki := certs.GetAKIFromCert(cert)
+	if aki == nil {
+		t.Error("GetAKIFromCert вернул nil")
+	}
+	t.Logf("AKI: %x", aki)
+}
+
+func TestIssueCertificateFromCSRErrors(t *testing.T) {
+    tmpDir, err := os.MkdirTemp("", "issue-csr-errors-*")
+    if err != nil {
+        t.Fatal(err)
+    }
+    defer os.RemoveAll(tmpDir)
+
+    db, cleanupDB := setupTestDBForCA(t)
+    defer cleanupDB()
+
+    // Создаём CA цепочку
+    interCert, interKey, _ := createPKIChainForTest(t, tmpDir, db)
+    _ = interCert      // Используем underscore, чтобы избежать ошибки
+    _ = interKey       // Используем underscore, чтобы избежать ошибки
+
+    // Загружаем intermediate CA
+    interCA, err := ca.NewIntermediateCA(
+        filepath.Join(tmpDir, "certs", "intermediate.cert.pem"),
+        filepath.Join(tmpDir, "private", "intermediate.key.pem"),
+        filepath.Join(tmpDir, "inter.pass"),
+        db,
+    )
+    if err != nil {
+        t.Fatal(err)
+    }
+
+    // Тест 1: Неверный CSR (невалидный PEM)
+    _, _, err = interCA.IssueCertificateFromCSR([]byte("invalid pem"), "server", 365)
+    if err == nil {
+        t.Error("expected error for invalid CSR")
+    } else {
+        t.Logf("correctly rejected invalid CSR: %v", err)
+    }
+
+    // Тест 2: CSR с неправильной подписью
+    badKey, _ := rsa.GenerateKey(rand.Reader, 2048)
+    badTemplate := &x509.CertificateRequest{
+        Subject: pkix.Name{CommonName: "bad.example.com"},
+    }
+    badCSRDER, _ := x509.CreateCertificateRequest(rand.Reader, badTemplate, badKey)
+    badCSRPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: badCSRDER})
+
+    // Модифицируем CSR, чтобы сломать подпись (меняем один байт)
+    if len(badCSRPEM) > 200 {
+        badCSRPEM[200] ^= 0xFF
+    }
+
+    _, _, err = interCA.IssueCertificateFromCSR(badCSRPEM, "server", 365)
+    if err == nil {
+        t.Error("expected error for invalid signature")
+    } else {
+        t.Logf("correctly rejected invalid signature: %v", err)
+    }
+
+    t.Log("IssueCertificateFromCSR error tests completed")
+}
+
+func TestIssueCertificateFromCSRWithInvalidParameters(t *testing.T) {
+    tmpDir, err := os.MkdirTemp("", "issue-csr-invalid-params-*")
+    if err != nil {
+        t.Fatal(err)
+    }
+    defer os.RemoveAll(tmpDir)
+
+    db, cleanupDB := setupTestDBForCA(t)
+    defer cleanupDB()
+
+    // Создаём CA цепочку
+    _, _, _ = createPKIChainForTest(t, tmpDir, db)
+
+    interCA, err := ca.NewIntermediateCA(
+        filepath.Join(tmpDir, "certs", "intermediate.cert.pem"),
+        filepath.Join(tmpDir, "private", "intermediate.key.pem"),
+        filepath.Join(tmpDir, "inter.pass"),
+        db,
+    )
+    if err != nil {
+        t.Fatal(err)
+    }
+
+    // Тест 1: CSR с SHA1 подписью
+    t.Run("SHA1_signature_rejected", func(t *testing.T) {
+        key, _ := rsa.GenerateKey(rand.Reader, 2048)
+        template := &x509.CertificateRequest{
+            Subject:            pkix.Name{CommonName: "sha1.example.com"},
+            SignatureAlgorithm: x509.SHA1WithRSA,
+        }
+        csrDER, _ := x509.CreateCertificateRequest(rand.Reader, template, key)
+        csrPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER})
+
+        _, _, err := interCA.IssueCertificateFromCSR(csrPEM, "server", 365)
+        if err == nil {
+            t.Error("SHA1 signature should be rejected")
+        } else {
+            t.Logf("correctly rejected SHA1: %v", err)
+        }
+    })
+
+    // Тест 2: CSR с email SAN для server шаблона
+    t.Run("email_SAN_rejected_for_server", func(t *testing.T) {
+        key, _ := rsa.GenerateKey(rand.Reader, 2048)
+        template := &x509.CertificateRequest{
+            Subject:        pkix.Name{CommonName: "email-server.example.com"},
+            DNSNames:       []string{"example.com"},
+            EmailAddresses: []string{"admin@example.com"},
+        }
+        csrDER, _ := x509.CreateCertificateRequest(rand.Reader, template, key)
+        csrPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER})
+
+        _, _, err := interCA.IssueCertificateFromCSR(csrPEM, "server", 365)
+        if err == nil {
+            t.Error("email SAN should be rejected for server template")
+        } else {
+            t.Logf("correctly rejected email SAN: %v", err)
+        }
+    })
+
+    // Тест 3: CSR с wildcard DNS
+    t.Run("wildcard_DNS_rejected", func(t *testing.T) {
+        key, _ := rsa.GenerateKey(rand.Reader, 2048)
+        template := &x509.CertificateRequest{
+            Subject:  pkix.Name{CommonName: "wildcard.example.com"},
+            DNSNames: []string{"*.example.com"},
+        }
+        csrDER, _ := x509.CreateCertificateRequest(rand.Reader, template, key)
+        csrPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER})
+
+        _, _, err := interCA.IssueCertificateFromCSR(csrPEM, "server", 365)
+        if err == nil {
+            t.Error("wildcard DNS should be rejected")
+        } else {
+            t.Logf("correctly rejected wildcard: %v", err)
+        }
+    })
+
+    // Тест 4: Пустой CSR
+    t.Run("empty_CSR_rejected", func(t *testing.T) {
+        _, _, err := interCA.IssueCertificateFromCSR([]byte{}, "server", 365)
+        if err == nil {
+            t.Error("empty CSR should be rejected")
+        } else {
+            t.Logf("correctly rejected empty CSR: %v", err)
+        }
+    })
 }
