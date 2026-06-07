@@ -98,7 +98,7 @@ test-repo:
 
 test-crl:
 	@echo "Запуск тестов CRL..."
-	$(GOTEST) -v ./tests/crl_test.go
+	$(GOTEST) -v ./tests/ -run "TestCRL"
 
 test-revocation:
 	@echo "Запуск тестов отзыва..."

@@ -164,14 +164,7 @@ func (ca *RootCA) Initialize() error {
 	}
 	logger.Info("сертификат сохранен")
 
-	if ca.DB != nil {
-		logger.Info("сохранение корневого сертификата в БД")
-		if err := ca.DB.InsertCertificate(ca.certificate, ca.certPEM, "valid"); err != nil {
-			logger.Error("ошибка вставки сертификата в БД: %v", err)
-		} else {
-			logger.Info("корневой сертификат сохранен в БД")
-		}
-	}
+	// Корневой сертификат НЕ сохраняется в БД (только в файловой системе)
 
 	logger.Info("проверка соответствия ключа и сертификата...")
 	if err := ca.verifyKeyPair(); err != nil {

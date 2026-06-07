@@ -660,8 +660,8 @@ func runCAInit(cmd *cobra.Command, args []string) error {
 	if err := pol.ValidateKeySize(keyType, keySize, policy.RootCA); err != nil {
 		logger.Error("нарушение политики размера ключа: %v", err)
 		logger.LogAuditError("policy_violation", err.Error(), map[string]interface{}{
-			"key_type": keyType,
-			"key_size": keySize,
+			"key_type":  keyType,
+			"key_size":  keySize,
 			"cert_type": "root_ca",
 		})
 		return err
@@ -670,7 +670,7 @@ func runCAInit(cmd *cobra.Command, args []string) error {
 		logger.Error("нарушение политики срока действия: %v", err)
 		logger.LogAuditError("policy_violation", err.Error(), map[string]interface{}{
 			"validity_days": validityDays,
-			"cert_type": "root_ca",
+			"cert_type":     "root_ca",
 		})
 		return err
 	}
@@ -690,7 +690,6 @@ func runCAInit(cmd *cobra.Command, args []string) error {
 			logger.Warn("не удалось открыть БД: %v", err)
 		} else {
 			defer db.Close()
-			certs.InitSerialGenerator(db)
 		}
 	}
 
@@ -746,8 +745,8 @@ func runCAIssueIntermediate(cmd *cobra.Command, args []string) error {
 	if err := pol.ValidateKeySize(keyType, keySize, policy.IntermediateCA); err != nil {
 		logger.Error("нарушение политики размера ключа: %v", err)
 		logger.LogAuditError("policy_violation", err.Error(), map[string]interface{}{
-			"key_type": keyType,
-			"key_size": keySize,
+			"key_type":  keyType,
+			"key_size":  keySize,
 			"cert_type": "intermediate_ca",
 		})
 		return err
@@ -756,7 +755,7 @@ func runCAIssueIntermediate(cmd *cobra.Command, args []string) error {
 		logger.Error("нарушение политики срока действия: %v", err)
 		logger.LogAuditError("policy_violation", err.Error(), map[string]interface{}{
 			"validity_days": validityDays,
-			"cert_type": "intermediate_ca",
+			"cert_type":     "intermediate_ca",
 		})
 		return err
 	}
@@ -1039,12 +1038,12 @@ func runCAIssueCert(cmd *cobra.Command, args []string) error {
 	initAuditIfNeeded(filepath.Dir(filepath.Dir(outDir)))
 
 	pol := getPolicy()
-	
+
 	if err := pol.ValidateValidityPeriod(policy.EndEntity, validityDays); err != nil {
 		logger.Error("нарушение политики срока действия: %v", err)
 		logger.LogAuditError("policy_violation", err.Error(), map[string]interface{}{
 			"validity_days": validityDays,
-			"cert_type": "end_entity",
+			"cert_type":     "end_entity",
 		})
 		return err
 	}
