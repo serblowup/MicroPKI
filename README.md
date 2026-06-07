@@ -1,9 +1,6 @@
 # MicroPKI
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Go Report Card](https://goreportcard.com/badge/github.com/serblowup/MicroPKI)](https://goreportcard.com/report/github.com/serblowup/MicroPKI)
-[![Go Version](https://img.shields.io/github/go-mod/go-version/serblowup/MicroPKI)](https://golang.org/)
-[![CI](https://github.com/serblowup/MicroPKI/actions/workflows/test.yml/badge.svg)](https://github.com/serblowup/MicroPKI/actions/workflows/test.yml)
 [![Coverage](https://img.shields.io/badge/coverage-79.3%25-brightgreen)](https://github.com/serblowup/MicroPKI)
 
 Минимальная реализация инфраструктуры открытых ключей (PKI) в рамках курса криптографии.
